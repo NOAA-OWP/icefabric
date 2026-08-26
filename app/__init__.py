@@ -1,3 +1,5 @@
+from logging import Logger
+
 from fastapi import HTTPException, Request
 from pyiceberg.catalog import Catalog
 from rustworkx import PyDiGraph

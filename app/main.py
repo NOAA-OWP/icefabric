@@ -1,4 +1,5 @@
 import argparse
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,15 +30,24 @@ from app.routers.streamflow_observations.router import api_router as streamflow_
 from icefabric.builds import load_upstream_json
 from icefabric.helpers import load_creds
 
+# Configure basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(asctime)s - %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# Create a logger instance
+main_logger = logging.getLogger(__name__)
+
 tags_metadata = [
+    {
+        "name": "Streamflow Observations",
+        "description": "Data querying functions for observational streamflow time series (USGS, local agencies, etc.)",
+    },
     {
         "name": "Hydrofabric Services",
         "description": "Data Querying functions for the Hydrofabric",
-    },
-    {
-        "name": "RISE",
-        "description": "An interface to the RISE API for querying reservoir outflow data",
-        "externalDocs": {"description": "Link to the RISE API", "url": "https://data.usbr.gov/rise-api"},
     },
     {
         "name": "NWM Modules",
@@ -46,6 +56,11 @@ tags_metadata = [
     {
         "name": "HEC-RAS XS",
         "description": "Data querying functions for HEC-RAS cross-sectional data (i.e. per flowpath ID or geospatial queries)",
+    },
+    {
+        "name": "RISE",
+        "description": "An interface to the RISE API for querying reservoir outflow data",
+        "externalDocs": {"description": "Link to the RISE API", "url": "https://data.usbr.gov/rise-api"},
     },
 ]
 
@@ -70,6 +85,8 @@ async def lifespan(app: FastAPI):
     app: FastAPI
         The FastAPI app instance
     """
+    app.state.main_logger = main_logger
+    app.state.main_logger.info("Application starting up.")
     load_creds()
     catalog = load_catalog(args.catalog)
     hydrofabric_namespaces = ["conus_hf", "ak_hf", "hi_hf", "prvi_hf"]
@@ -85,6 +102,7 @@ async def lifespan(app: FastAPI):
             "Cannot load API as the Hydrofabric Database/Namespace cannot be connected to. Please ensure you are have access to the correct hydrofabric namespaces"
         ) from None
     yield
+    app.state.main_logger.info("Application shutting down.")
 
 
 app = FastAPI(

@@ -7,13 +7,13 @@ import rasterio
 from dotenv import load_dotenv
 from pyprojroot import here
 
-from icefabric.builds import IcechunkRepo
-from icefabric.schemas import NGWPCTestLocations
+from icefabric.builds.icechunk_s3_module import IcechunkRepo
+from icefabric.schemas.icechunk import NGWPCTestLocations
 
 load_dotenv()
 
 
-@pytest.mark.slow
+@pytest.mark.ultraslow
 def test_topobathy(ic_raster: str) -> None:
     """This test is SLOW. It will temporarily download all topobathy layers, up to 9 GB individually.
     To run, call `pytest tests --run-slow`

@@ -1,22 +1,27 @@
+import gzip
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
+import geopandas as gpd
 import pandas as pd
 import polars as pl
 import pyarrow as pa
 import pytest
 import rustworkx as rx
+import xarray as xr
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
+from icechunk import Repository, local_filesystem_storage
+from icechunk.xarray import to_icechunk
 from pyiceberg.catalog import Catalog, load_catalog
-from pyiceberg.expressions import EqualTo, In
+from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, In, LessThanOrEqual
 from pyprojroot import here
 
 from app.main import app
-from icefabric.builds import load_upstream_json
 from icefabric.builds.graph_connectivity import read_edge_attrs, read_node_attrs
-from icefabric.schemas import NGWPCTestLocations
+from icefabric.schemas.icechunk import NGWPCTestLocations
 
 """
 Unified Mock PyIceberg Catalog Test Suite for Hydrofabric v2.2 Data using RustworkX Graph
@@ -25,6 +30,12 @@ Unified Mock PyIceberg Catalog Test Suite for Hydrofabric v2.2 Data using Rustwo
 # Load the sample graph from the actual graph file
 SAMPLE_GRAPH: rx.PyDiGraph = rx.from_node_link_json_file(
     str(here() / "tests/data/hi_hf_graph_network.json"),
+    edge_attrs=read_edge_attrs,
+    node_attrs=read_node_attrs,
+)  # type: ignore
+
+HF_GRAPH: rx.PyDiGraph = rx.from_node_link_json_file(
+    str(here() / "tests/data/conus_hf_graph_network.json"),
     edge_attrs=read_edge_attrs,
     node_attrs=read_node_attrs,
 )  # type: ignore
@@ -54,6 +65,10 @@ class MockTable:
         """Returns data as Polars DataFrame"""
         return self._polars_data
 
+    def snapshot_by_id(self, snap_id):
+        """Mocks the snapshot_by_id method for iceberg tables"""
+        return None
+
 
 class MockScan:
     """Mock scan result that can be filtered and converted"""
@@ -76,6 +91,18 @@ class MockScan:
             column_name = self.row_filter.term.name
             values = [lit.value for lit in self.row_filter.literals]
             return self.data.filter(pl.col(column_name).is_in(values)).collect()
+        elif isinstance(self.row_filter, And):
+            # import pdb; pdb.set_trace()
+            if isinstance(self.row_filter.left, And) and isinstance(self.row_filter.right, And):
+                left, right = self.row_filter.left, self.row_filter.right
+                for exp in [left.left, left.right, right.left, right.right]:
+                    column_name = exp.term.name
+                    value = exp.literal.value
+                    if isinstance(exp, GreaterThanOrEqual):
+                        self.data = self.data.filter(pl.col(column_name) >= value)
+                    elif isinstance(exp, LessThanOrEqual):
+                        self.data = self.data.filter(pl.col(column_name) <= value)
+                return self.data.collect()
 
         return self.data.collect()
 
@@ -100,6 +127,7 @@ class MockCatalog:
         self.connectivity_graph = SAMPLE_GRAPH
         self.name = "mock_hf"
         self.tables = self._create_sample_tables()
+        app.state.network_graphs = {"hi_hf": SAMPLE_GRAPH}
 
     def load_table(self, table_name: str) -> MockTable:
         """Load a mock table by name"""
@@ -175,6 +203,30 @@ class MockCatalog:
         )
         tables["divide_parameters.snow-17_conus"] = MockTable(
             "divide_parameters.snow-17_conus", self._create_snow17_divide_parameters(network_data)
+        )
+
+        # Tables for Hydrofabric router testing
+        # Hydrofabric Router does not accept mock_hf as a namespace during input validation
+        tables["hi_hf.divide-attributes"] = tables["mock_hf.divide-attributes"]
+        tables["hi_hf.divides"] = tables["mock_hf.divides"]
+        tables["hi_hf.flowpath-attributes"] = tables["mock_hf.flowpath-attributes"]
+        tables["hi_hf.flowpath-attributes-ml"] = tables["mock_hf.flowpath-attributes-ml"]
+        tables["hi_hf.flowpaths"] = tables["mock_hf.flowpaths"]
+        tables["hi_hf.hydrolocations"] = tables["mock_hf.hydrolocations"]
+        tables["hi_hf.lakes"] = tables["mock_hf.lakes"]
+        tables["hi_hf.network"] = tables["mock_hf.network"]
+        tables["hi_hf.nexus"] = tables["mock_hf.nexus"]
+        tables["hi_hf.pois"] = tables["mock_hf.pois"]
+
+        # Hydrofabric snapshot history table
+        tables["hydrofabric_snapshots.id"] = MockTable(
+            "hydrofabric_snapshots.id", self._create_snapshot_history_data()
+        )
+
+        # RAS_XS tables
+        tables["ras_xs.conflated"] = MockTable("ras_xs.conflated", self._create_ras_xs_data("conflated"))
+        tables["ras_xs.representative"] = MockTable(
+            "ras_xs.representative", self._create_ras_xs_data("representative")
         )
 
         return tables
@@ -494,6 +546,9 @@ class MockCatalog:
                     "mean.slope": 0.05 + (hash(row["divide_id"]) % 100) / 1000.0,  # DoubleType
                     "circ_mean.aspect": 180.0,  # DoubleType
                     "dist_4.twi": '[{"v":0.6137,"frequency":0.2501},{"v":2.558,"frequency":0.2499}]',  # StringType
+                    "centroid_x": -100.0 + (hash(row["divide_id"]) % 1000) / 1000.0,  # DoubleType
+                    "centroid_y": 40.0 + (hash(row["divide_id"]) % 500) / 500.0,  # DoubleType
+                    "glacier_percent": 0.0,  # DoubleType
                     "vpuid": "hi",  # StringType
                 }
             )
@@ -654,6 +709,23 @@ class MockCatalog:
 
         return pd.DataFrame(hydrolocations)
 
+    def _create_ras_xs_data(self, type) -> pd.DataFrame:
+        file_name = f"ras_xs_subset_{type}.gpkg"
+        xs_data = here() / f"tests/data/{file_name}"
+        if type == "conflated":
+            if not os.path.exists(xs_data):
+                with gzip.open(f"{xs_data}.gz", "rb") as gz_file:
+                    with open(xs_data, "wb") as out_file:
+                        shutil.copyfileobj(gz_file, out_file)
+        df = gpd.read_file(xs_data).to_wkb()
+        return df
+
+    def _create_snapshot_history_data(self) -> pd.DataFrame:
+        file_name = "snapshots_history_table.json"
+        snapshots_history = here() / f"tests/data/{file_name}"
+        df = pd.read_json(snapshots_history, orient="records")
+        return df
+
 
 # Utility functions for test setup
 def create_test_environment(tmp_path: Path) -> dict[str, Any]:
@@ -715,22 +787,19 @@ else:
         "Cannot find .pyiceberg.yaml. Please download this from NGWPC confluence or create "
     )
 
-# Test data constants
-sample_hf_uri = [
-    "gages-01010000",
-    "gages-02450825",
-    "gages-03173000",
-    "gages-04100500",
-    "gages-05473450",
-    "gages-06823500",
-    "gages-07060710",
-    "gages-08070000",
-    "gages-09253000",
-    "gages-10316500",
-    "gages-11456000",
-    "gages-12411000",
-    "gages-13337000",
-    "gages-14020000",
+# Hydrofabric router data constants
+wb_id_good = [
+    "wb-1833",
+    "wb-1795",
+    "wb-2116",
+    "wb-1288",
+]
+
+wb_id_bad = [
+    "wb-991833",
+    "wb-991795",
+    "wb-992116",
+    "wb-991288",
 ]
 
 test_ic_rasters = [f for f in NGWPCTestLocations._member_names_ if "TOPO" in f]
@@ -799,6 +868,51 @@ def temp_graph_file(tmp_path):
     return graph_file
 
 
+@pytest.fixture(scope="function")
+def mock_streamflow_api(mocker, tmpdir):
+    """Creates an in memory iceberg table for streamflow to be used in steamflow API's `get_data_and_repo_hist`
+    Dataset includes:
+        ds.sel(time=slice("2021-12-31 12:00:00", "2022-01-01 14:00:00"), id=['01010000', '01031500'])
+    from:
+    {
+      "snapshot_id": "NVR3S5HRVCJC2NMJZSNG",
+      "commit_message": "Uploaded all USGS/ENVCA/CADWR/TXDOT gages to the store",
+      "timestamp": "2025-09-20T07:00:53.334882+00:00"
+    }
+    """
+    repo = Repository.create(storage=local_filesystem_storage(tmpdir))
+    session = repo.writable_session("main")
+    data = xr.open_zarr(here() / "tests/data/streamflow.zarr", consolidated=False)
+    to_icechunk(data, session=session, mode="w")
+    ds = xr.open_zarr(session.store, consolidated=False)
+
+    return mocker.patch(
+        "app.routers.streamflow_observations.router.get_data_and_repo_hist", return_value=(ds, repo)
+    )
+
+
+@pytest.fixture(scope="function")
+def mock_streamflow_cli(mocker, tmpdir):
+    """Creates an in memory iceberg table for streamflow to be used in steamflow CLI's `get_dataset`
+
+    Dataset includes:
+        ds.sel(time=slice("2021-12-31 12:00:00", "2022-01-01 14:00:00"), id=['01010000', '01031500'])
+    from:
+    {
+      "snapshot_id": "NVR3S5HRVCJC2NMJZSNG",
+      "commit_message": "Uploaded all USGS/ENVCA/CADWR/TXDOT gages to the store",
+      "timestamp": "2025-09-20T07:00:53.334882+00:00"
+    }
+    """
+    repo = Repository.create(storage=local_filesystem_storage(tmpdir))
+    session = repo.writable_session("main")
+    data = xr.open_zarr(here() / "tests/data/streamflow.zarr", consolidated=False)
+    to_icechunk(data, session=session, mode="w")
+    ds = xr.open_zarr(session.store, consolidated=False)
+
+    return mocker.patch("icefabric.cli.streamflow.get_dataset", return_value=ds)
+
+
 @pytest.fixture(params=test_ic_rasters)
 def ic_raster(request) -> str:
     """Returns AWS S3 icechunk stores/rasters for checking correctness"""
@@ -811,9 +925,15 @@ def local_ic_raster(request) -> Path:
     return request.param
 
 
-@pytest.fixture(params=sample_hf_uri)
-def gauge_hf_uri(request) -> str:
-    """Returns individual gauge identifiers for parameterized testing"""
+@pytest.fixture(params=wb_id_good)
+def watershed_bound_id_good(request) -> str:
+    """Returns individual good gauge identifiers for parameterized testing"""
+    return request.param
+
+
+@pytest.fixture(params=wb_id_bad)
+def watershed_bound_id_bad(request) -> str:
+    """Returns individual bad gauge identifiers for parameterized testing"""
     return request.param
 
 
@@ -821,34 +941,6 @@ def gauge_hf_uri(request) -> str:
 def testing_dir() -> Path:
     """Returns the testing data dir"""
     return here() / "tests/data/"
-
-
-@pytest.fixture(scope="session")
-def remote_client():
-    """Create a test client for the FastAPI app with real Glue catalog."""
-    catalog = load_catalog("glue")
-    hydrofabric_namespaces = ["conus_hf", "ak_hf", "gl_hf", "hi_hf", "prvi_hf"]
-    app.state.catalog = catalog
-    app.state.network_graphs = load_upstream_json(
-        catalog=catalog,
-        namespaces=hydrofabric_namespaces,
-        output_path=here() / "data",
-    )
-    return TestClient(app)
-
-
-@pytest.fixture(scope="session")
-def remote_client():
-    """Create a test client for the FastAPI app with real Glue catalog."""
-    catalog = load_catalog("glue")
-    hydrofabric_namespaces = ["conus_hf", "ak_hf", "gl_hf", "hi_hf", "prvi_hf"]
-    app.state.catalog = catalog
-    app.state.network_graphs = load_upstream_json(
-        catalog=catalog,
-        namespaces=hydrofabric_namespaces,
-        output_path=here() / "data",
-    )
-    return TestClient(app)
 
 
 @pytest.fixture(scope="session")
@@ -861,14 +953,26 @@ def client():
 @pytest.fixture
 def local_usgs_streamflow_csv():
     """Returns a locally downloaded CSV file from a specific gauge and time"""
-    file_path = here() / "tests/data/usgs_01010000_data_from_20211231_1400_to_20220101_1400.csv"
+    file_path = here() / "tests/data/hourly_streamflow_data_01010000_from_20211231_1400_to_20220101_1400.csv"
+    return pd.read_csv(file_path)
+
+
+@pytest.fixture
+def local_usgs_streamflow_csv__no_headers():
+    """Returns a locally downloaded CSV file from a specific gauge and time"""
+    file_path = (
+        here()
+        / "tests/data/hourly_streamflow_data_01010000_from_20211231_1400_to_20220101_1400_no_headers.csv"
+    )
     return pd.read_csv(file_path)
 
 
 @pytest.fixture
 def local_usgs_streamflow_parquet():
     """Returns a locally downloaded Parquet file from a specific gauge and time"""
-    file_path = here() / "tests/data/usgs_01010000_data_from_20211231_1400_to_20220101_1400.parquet"
+    file_path = (
+        here() / "tests/data/hourly_streamflow_data_01010000_from_20211231_1400_to_20220101_1400.parquet"
+    )
     return pd.read_parquet(file_path)
 
 
@@ -894,6 +998,12 @@ def pytest_addoption(parser):
         help="Run slow tests",
     )
     parser.addoption(
+        "--run-ultra-slow",
+        action="store_true",
+        default=False,
+        help="Run ultra slow tests",
+    )
+    parser.addoption(
         "--run-local",
         action="store_true",
         default=False,
@@ -909,6 +1019,12 @@ def pytest_collection_modifyitems(config, items):
             if "slow" in item.keywords:
                 item.add_marker(skipper)
 
+    if not config.getoption("--run-ultra-slow"):
+        skipper = pytest.mark.skip(reason="Only run when --run-slow is given")
+        for item in items:
+            if "ultraslow" in item.keywords:
+                item.add_marker(skipper)
+
     if not config.getoption("--run-local"):
         skipper = pytest.mark.skip(reason="Only run when --run-local is given")
         for item in items:
@@ -919,6 +1035,7 @@ def pytest_collection_modifyitems(config, items):
 def pytest_configure(config):
     """Configure pytest markers."""
     config.addinivalue_line("markers", "slow: marks tests as slow tests")
+    config.addinivalue_line("markers", "ultraslow: marks tests as ultra slow tests")
     config.addinivalue_line("markers", "local: marks tests as local tests")
     config.addinivalue_line("markers", "performance: marks tests as performance tests")
     config.addinivalue_line("markers", "integration: marks tests as integration tests")

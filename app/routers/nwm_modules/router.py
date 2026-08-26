@@ -5,15 +5,16 @@ from app import get_catalog, get_graphs
 from icefabric.modules import SmpModules, config_mapper
 from icefabric.schemas import HydrofabricDomains
 from icefabric.schemas.modules import (
-    Albedo,
     LASAM,
     LSTM,
-    NoahOwpModular,
-    SacSma,
     SFT,
     SMP,
+    Albedo,
+    NoahOwpModular,
+    SacSma,
     Snow17,
     Topmodel,
+    Topoflow,
     TRoute,
 )
 
@@ -29,7 +30,7 @@ topmodel_router = APIRouter(prefix="/modules/topmodel")
 topoflow_router = APIRouter(prefix="/modules/topoflow")
 
 
-@sft_router.get("/", tags=["HF Modules"])
+@sft_router.get("/", tags=["NWM Modules"])
 async def get_sft_ipes(
     identifier: str = Query(
         ...,
@@ -407,40 +408,41 @@ async def get_topmodel_ipes(
 
 
 # TODO - Restore endpoint once the generation of IPEs for TopoFlow is possible/implemented
-# @topoflow_router.get("/", tags=["NWM Modules"])
-# async def get_topoflow_ipes(
-#     identifier: str = Query(
-#         ...,
-#         description="Gage ID from which to trace upstream catchments.",
-#         examples=["01010000"],
-#         openapi_examples={"topoflow_example": {"summary": "TopoFlow Example", "value": "01010000"}},
-#     ),
-#     domain: HydrofabricDomains = Query(
-#         HydrofabricDomains.CONUS,
-#         description="The iceberg namespace used to query the hydrofabric.",
-#         openapi_examples={"topoflow_example": {"summary": "TopoFlow Example", "value": "conus_hf"}},
-#     ),
-#     catalog: Catalog = Depends(get_catalog),
-# ) -> list[Topoflow]:
-#     """
-#     An endpoint to return configurations for TopoFlow.
-#
-#     This endpoint traces upstream from a given gage ID to get all catchments
-#     and returns TopoFlow parameter configurations for each catchment.
-#
-#     **Parameters:**
-#     - **identifier**: The Gage ID from which upstream catchments are traced.
-#     - **domain**: The geographic domain used to filter catchments.
-#
-#     **Returns:**
-#     A list of TopoFlow pydantic objects for each catchment.
-#     """
-#     return config_mapper["topoflow"](
-#         catalog=catalog,
-#         namespace=domain.value,
-#         identifier=f"gages-{identifier}",
-#         graph=network_graphs[domain],
-#     )
+@topoflow_router.get("/", tags=["NWM Modules"])
+async def get_topoflow_ipes(
+    identifier: str = Query(
+        ...,
+        description="Gage ID from which to trace upstream catchments.",
+        examples=["01010000"],
+        openapi_examples={"topoflow_example": {"summary": "TopoFlow Example", "value": "01010000"}},
+    ),
+    domain: HydrofabricDomains = Query(
+        HydrofabricDomains.CONUS,
+        description="The iceberg namespace used to query the hydrofabric.",
+        openapi_examples={"topoflow_example": {"summary": "TopoFlow Example", "value": "conus_hf"}},
+    ),
+    catalog: Catalog = Depends(get_catalog),
+    network_graphs=Depends(get_graphs),
+) -> list[Topoflow]:
+    """
+    An endpoint to return configurations for TopoFlow.
+
+    This endpoint traces upstream from a given gage ID to get all catchments
+    and returns TopoFlow parameter configurations for each catchment.
+
+    **Parameters:**
+    - **identifier**: The Gage ID from which upstream catchments are traced.
+    - **domain**: The geographic domain used to filter catchments.
+
+    **Returns:**
+    A list of TopoFlow pydantic objects for each catchment.
+    """
+    return config_mapper["topoflow"](
+        catalog=catalog,
+        namespace=domain.value,
+        identifier=f"gages-{identifier}",
+        graph=network_graphs[domain],
+    )
 
 
 @topoflow_router.get("/albedo", tags=["NWM Modules"])
