@@ -120,7 +120,6 @@ app.include_router(topoflow_router, prefix="/v1")
 app.include_router(ras_api_router, prefix="/v1")
 app.include_router(rise_api_wrap_router, prefix="/v1")
 
-
 @app.get(
     "/health",
     tags=["Health"],
@@ -129,17 +128,18 @@ app.include_router(rise_api_wrap_router, prefix="/v1")
     status_code=status.HTTP_200_OK,
     response_model=HealthCheck,
 )
-@app.head(
+
+@app.get(
     "/health",
     tags=["Health"],
     summary="Perform a Health Check",
     response_description="Return HTTP Status Code 200 (OK)",
     status_code=status.HTTP_200_OK,
 )
+
 def get_health() -> HealthCheck:
     """Returns a HealthCheck for the server"""
     return HealthCheck(status="OK")
-
 
 # Mount static files for mkdocs at the root
 # This tells FastAPI to serve the static documentation files at the '/' URL

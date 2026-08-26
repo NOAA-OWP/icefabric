@@ -838,6 +838,20 @@ def remote_client():
 
 
 @pytest.fixture(scope="session")
+def remote_client():
+    """Create a test client for the FastAPI app with real Glue catalog."""
+    catalog = load_catalog("glue")
+    hydrofabric_namespaces = ["conus_hf", "ak_hf", "gl_hf", "hi_hf", "prvi_hf"]
+    app.state.catalog = catalog
+    app.state.network_graphs = load_upstream_json(
+        catalog=catalog,
+        namespaces=hydrofabric_namespaces,
+        output_path=here() / "data",
+    )
+    return TestClient(app)
+
+
+@pytest.fixture(scope="session")
 def client():
     """Create a test client for the FastAPI app with mock catalog."""
     app.state.catalog = MockCatalog()  # defaulting to use the mock catalog
