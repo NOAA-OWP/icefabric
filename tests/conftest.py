@@ -838,6 +838,13 @@ def remote_client():
 
 
 @pytest.fixture(scope="session")
+def remote_client():
+    """Create a test client for the FastAPI app with real Glue catalog."""
+    app.state.catalog = load_catalog("glue")  # defaulting to use the glue
+    return TestClient(app)
+
+
+@pytest.fixture(scope="session")
 def client():
     """Create a test client for the FastAPI app with mock catalog."""
     app.state.catalog = MockCatalog()  # defaulting to use the mock catalog
