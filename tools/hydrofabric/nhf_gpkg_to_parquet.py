@@ -4,16 +4,13 @@ import argparse
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 import pyarrow as pa
 from pyarrow import parquet as pq
 from pyogrio.errors import DataLayerError
 
 from icefabric.helpers import load_creds
-from icefabric.schemas.iceberg_tables.hydrofabric_update import (
-    Divides,
-    Flowpaths,
-    Nexus,
-)
+from icefabric.schemas.iceberg_tables import nhf_layers
 
 load_creds()
 
@@ -33,12 +30,7 @@ def nhf_gpkg_to_parquet(input_file: Path, output_folder: Path) -> None:
     FileNotFoundError
         If the input file doesn't exist
     """
-    layers = [
-        ("divides", Divides),
-        ("flowpaths", Flowpaths),
-        ("nexus", Nexus),
-    ]
-    for layer, schema in layers:
+    for layer, schema in nhf_layers.items():
         if not input_file.exists():
             raise FileNotFoundError(f"Input file not found: {input_file}")
 
@@ -52,11 +44,27 @@ def nhf_gpkg_to_parquet(input_file: Path, output_folder: Path) -> None:
             print(f"No layer existing for: {layer}")
             continue
         if "geometry" in gdf.columns:
-            # NOTE there will be an warning as we're overriding the geometry. This is fine for now
             gdf["geometry"] = gdf["geometry"].to_wkb()
+            # Drop the GeoDataFrame's geometry reference
+            gdf = pd.DataFrame(gdf)
+
+        # Add missing nullable columns as null (handles domain differences)
+        for col in schema.columns():
+            if col not in gdf.columns:
+                gdf[col] = None
+
+        # Coerce string-encoded numeric columns to match the arrow schema
+        arrow_schema = schema.arrow_schema()
+        for field in arrow_schema:
+            if (
+                field.name in gdf.columns
+                and gdf[field.name].dtype == object
+                and pa.types.is_integer(field.type)
+            ):
+                gdf[field.name] = pd.to_numeric(gdf[field.name], errors="coerce")
 
         # Create PyArrow table with schema validation
-        table = pa.Table.from_pandas(gdf[schema.columns()], schema=schema.arrow_schema())
+        table = pa.Table.from_pandas(gdf[schema.columns()], schema=arrow_schema)
 
         # Write parquet file
         output_path = output_folder / f"{layer}.parquet"

@@ -1,7 +1,7 @@
-import collections
 import json
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import polars as pl
 import rustworkx as rx
@@ -9,8 +9,9 @@ from ambiance import Atmosphere
 from pyiceberg.catalog import Catalog
 from pyproj import Transformer
 
-from icefabric.hydrofabric import subset_hydrofabric
-from icefabric.schemas.hydrofabric import IdType
+from icefabric.hydrofabric import subset_hydrofabric, subset_nhf
+from icefabric.modules.divide_attributes import DivideAttributesHF, DivideAttributesNHF
+from icefabric.schemas.hydrofabric import HydrofabricNamespace, IdType
 from icefabric.schemas.modules import (
     CFE,
     LASAM,
@@ -34,6 +35,72 @@ from icefabric.schemas.modules import (
 )
 
 
+def select_attr_names(namespace: HydrofabricNamespace) -> object:
+    """Selects the NHF or HF divide attribute name enum based on the namespace
+
+    Parameters
+    ----------
+    namespace : str
+        The namespace containing conus_hf or nhf
+
+    Returns
+    -------
+    object
+        The enum for the selected hydrofabric
+    """
+    if namespace.is_oconus_hf:
+        raise ValueError("subsets currently are not working for the HFv2.2 in OCONUS domains")
+    if namespace.is_nhf:
+        return DivideAttributesNHF
+    else:
+        return DivideAttributesHF
+
+
+def get_subset(
+    catalog: Catalog,
+    identifier: str | float,
+    namespace: HydrofabricNamespace,
+    graph: rx.PyDiGraph | None = None,
+) -> dict[str, pd.DataFrame | gpd.GeoDataFrame]:
+    """
+    Return a subset from NHF or HF 2.2
+
+    Parameters
+    ----------
+    catalog : Catalog
+        PyIceberg catalog
+    identifier : str | float
+        The identifier to subset around
+    namespace : str
+        Domain name / namespace
+    upstream_dict : Dict[str, Set[str]]
+        Pre-computed upstream lookup dictionary
+
+    Returns
+    -------
+    Dict[str, pd.DataFrame | gpd.GeoDataFrame]
+        Dictionary of layer names to their subsetted dataframes
+    """
+    if namespace.is_oconus_hf:
+        raise ValueError("subsets currently are not working for the HFv2.2 in OCONUS domains")
+    if namespace.is_nhf:
+        gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_nhf(
+            gage_id=identifier,
+            catalog=catalog,
+            namespace=namespace,
+        )
+    else:
+        gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
+            catalog=catalog,
+            identifier=identifier,
+            id_type=IdType.HL_URI,
+            namespace=namespace,
+            layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
+            graph=graph,
+        )
+    return gauge
+
+
 def _get_mean_soil_temp() -> float:
     """Returns an avg soil temp of 45 degrees F converted to Kelvin. This equation is just a reasonable estimate per new direction (EW: 07/2025)
 
@@ -47,7 +114,7 @@ def _get_mean_soil_temp() -> float:
 
 def get_sft_parameters(
     catalog: Catalog,
-    namespace: str,
+    namespace: HydrofabricNamespace,
     identifier: str,
     graph: rx.PyDiGraph,
     use_schaake: bool = False,
@@ -70,40 +137,29 @@ def get_sft_parameters(
     list[SFT]
         The list of all initial parameters for catchments using SFT
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {"smcmax": "mean.smcmax", "bexp": "mode.bexp", "psisat": "geom_mean.psisat"}
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
-    df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]  # Keep the divide_id
-    for param_name, prefix in attr.items():
-        # Find all columns that start with the prefix
-        matching_cols = [col for col in df.columns if col.startswith(prefix)]
-        if matching_cols:
-            # Calculate mean across matching columns for each row.
-            # NOTE: this assumes an even weighting. TODO: determine if we need to have weighted averaging
-            expressions.append(
-                pl.concat_list([pl.col(col) for col in matching_cols]).list.mean().alias(f"{param_name}_avg")
-            )
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}_avg"))
-    result_df = df.select(expressions)
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
+    attr_names = select_attr_names(namespace)
 
     pydantic_models = []
-    for row_dict in result_df.iter_rows(named=True):
+    for _, row_dict in divide_attr_df.iterrows():
+        # Quartz doesn't exist in the HF2.2 divide attributes, use default value.
+        if namespace.is_nhf:
+            quartz_value = row_dict[attr_names.QUARTZ.value]
+        else:
+            quartz_value = 1.0
         # Instantiate the Pydantic model for each row
         model_instance = SFT(
-            catchment=row_dict["divide_id"],
-            smcmax={"value": row_dict["smcmax_avg"], "units": "m/m"},
-            b={"value": row_dict["bexp_avg"], "units": None},
-            satpsi={"value": row_dict["psisat_avg"], "units": "m"},
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            smcmax={"value": row_dict[attr_names.SMCMAX.value], "units": "m/m"},
+            b={"value": row_dict[attr_names.BEXP.value], "units": None},
+            satpsi={"value": row_dict[attr_names.PSISAT.value], "units": "m"},
+            quartz={"value": quartz_value, "units": "m"},
             ice_fraction_scheme=IceFractionScheme.XINANJIANG
             if use_schaake is False
             else IceFractionScheme.SCHAAKE,
@@ -115,7 +171,7 @@ def get_sft_parameters(
 
 
 def get_snow17_parameters(
-    catalog: Catalog, namespace: str, identifier: str, envca: bool, graph: rx.PyDiGraph
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, envca: bool, graph: rx.PyDiGraph
 ) -> list[Snow17]:
     """Creates the initial parameter estimates for the Snow17 module
 
@@ -135,72 +191,65 @@ def get_snow17_parameters(
     list[Snow17]
         The list of all initial parameters for catchments using Snow17
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {"elevation_mean": "mean.elevation", "lat": "centroid_y", "lon": "centroid_x"}
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
     # Extraction of relevant features from divide attributes layer
     # & convert to polar
-    divide_attr_df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]
-    for param_name, prefix in attr.items():
-        # Find all columns that start with the prefix
-        matching_cols = [col for col in divide_attr_df.columns if col.startswith(prefix)]
-        if matching_cols:
-            expressions.append(pl.concat([pl.col(col) for col in matching_cols]).alias(f"{param_name}"))
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
+
+    attr_names = select_attr_names(namespace)
+
+    # Run HF2.2 specific items:
+    if not namespace.is_nhf:
+        # Get divide area from divides layer
+        divides_df = gauge["divides"][[attr_names.DIVIDE_ID.value, attr_names.AREA.value]]
+        divide_attr_df = pd.merge(divide_attr_df, divides_df, on="divide_id", how="left")
+
+        # Convert elevation from cm to m
+        divide_attr_df[attr_names.ELEVATION.value] = divide_attr_df[attr_names.ELEVATION.value] * 0.01
+
+        # Convert CRS to WGS84 (EPSG4326)
+        crs = gauge["divides"].crs
+        transformer = Transformer.from_crs(crs, 4326)
+        wgs84_latlon = transformer.transform(
+            divide_attr_df[attr_names.X.value], divide_attr_df[attr_names.Y.value]
+        )
+        divide_attr_df[attr_names.Y.value] = wgs84_latlon[0]
+        divide_attr_df[attr_names.X.value] = wgs84_latlon[1]
+
+        # Get Snow17 parameters from Iceberg tables
+        if not envca:
+            divides_list = divide_attr_df[attr_names.DIVIDE_ID.value]
+            domain = namespace.split("_")[0]
+            table_name = f"divide_parameters.snow-17_{domain}"
+            params_df = catalog.load_table(table_name).to_polars()
+            conus_param_df = (
+                params_df.filter(pl.col(attr_names.DIVIDE_ID.value).is_in(divides_list)).collect().to_pandas()
+            )
+            divide_attr_df = pd.merge(
+                divide_attr_df, conus_param_df, on=attr_names.DIVIDE_ID.value, how="left"
+            )
         else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}"))
-
-    divide_attr_df = divide_attr_df.select(expressions)
-
-    # Extraction of relevant features from divides layer
-    divides_df = gauge["divides"][["divide_id", "areasqkm"]]
-
-    # Ensure final result aligns properly based on each instances divide ids
-    result_df = pd.merge(divide_attr_df.to_pandas(), divides_df, on="divide_id", how="left")
-
-    # Convert elevation from cm to m
-    result_df["elevation_mean"] = result_df["elevation_mean"] * 0.01
-
-    # Convert CRS to WGS84 (EPSG4326)
-    crs = gauge["divides"].crs
-    transformer = Transformer.from_crs(crs, 4326)
-    wgs84_latlon = transformer.transform(result_df["lon"], result_df["lat"])
-    result_df["lat"] = wgs84_latlon[0]
-    result_df["lon"] = wgs84_latlon[1]
-
-    # Default parameter values used for oCONUS or if data is missing.
-    result_df["mfmax"] = CalibratableScheme.MFMAX.value
-    result_df["mfmin"] = CalibratableScheme.MFMIN.value
-    result_df["uadj"] = CalibratableScheme.UADJ.value
-
-    if namespace == "conus_hf" and not envca:
-        divides_list = result_df["divide_id"]
-        domain = namespace.split("_")[0]
-        table_name = f"divide_parameters.snow-17_{domain}"
-        params_df = catalog.load_table(table_name).to_polars()
-        conus_param_df = params_df.filter(pl.col("divide_id").is_in(divides_list)).collect().to_pandas()
-        result_df.drop(columns=["mfmax", "mfmin", "uadj"], inplace=True)
-        result_df = pd.merge(conus_param_df, result_df, on="divide_id", how="left")
+            # Attributes don't exist in the dataset for Canada
+            divide_attr_df["mfmax"] = CalibratableScheme.MFMAX.value
+            divide_attr_df["mfmin"] = CalibratableScheme.MFMIN.value
+            divide_attr_df["uadj"] = CalibratableScheme.UADJ.value
 
     pydantic_models = []
-    for _, row_dict in result_df.iterrows():
+    for _, row_dict in divide_attr_df.iterrows():
         model_instance = Snow17(
-            catchment=row_dict["divide_id"],
-            hru_id=row_dict["divide_id"],
-            hru_area=row_dict["areasqkm"],
-            latitude=row_dict["lat"],
-            elev=row_dict["elevation_mean"],
-            mfmax=row_dict["mfmax"],
-            mfmin=row_dict["mfmin"],
-            uadj=row_dict["uadj"],
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            hru_id=row_dict[attr_names.DIVIDE_ID.value],
+            hru_area=row_dict[attr_names.AREA.value],
+            latitude=row_dict[attr_names.Y.value],
+            elev=row_dict[attr_names.ELEVATION.value],
+            mfmax=row_dict[attr_names.MFMAX.value],
+            mfmin=row_dict[attr_names.MFMIN.value],
+            uadj=row_dict[attr_names.UADJ.value],
         )
         pydantic_models.append(model_instance)
     return pydantic_models
@@ -208,7 +257,7 @@ def get_snow17_parameters(
 
 def get_smp_parameters(
     catalog: Catalog,
-    namespace: str,
+    namespace: HydrofabricNamespace,
     identifier: str,
     graph: rx.PyDiGraph,
     extra_module: str | None = None,
@@ -232,31 +281,15 @@ def get_smp_parameters(
     list[SMP]
         The list of all initial parameters for catchments using SMP
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {"smcmax": "mean.smcmax", "bexp": "mode.bexp", "psisat": "geom_mean.psisat"}
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
-    df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]  # Keep the divide_id
-    for param_name, prefix in attr.items():
-        # Find all columns that start with the prefix
-        matching_cols = [col for col in df.columns if col.startswith(prefix)]
-        if matching_cols:
-            # Calculate mean across matching columns for each row.
-            # NOTE: this assumes an even weighting. TODO: determine if we need to have weighted averaging
-            expressions.append(
-                pl.concat_list([pl.col(col) for col in matching_cols]).list.mean().alias(f"{param_name}_avg")
-            )
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}_avg"))
-    result_df = df.select(expressions)
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
+
+    attr_names = select_attr_names(namespace)
 
     # Initializing parameters dependent to unique modules
     soil_storage_model = None
@@ -283,13 +316,13 @@ def get_smp_parameters(
             raise ValueError(f"Passing unsupported module into endpoint: {extra_module}")
 
     pydantic_models = []
-    for row_dict in result_df.iter_rows(named=True):
+    for _, row_dict in divide_attr_df.iterrows():
         # Instantiate the Pydantic model for each row
         model_instance = SMP(
-            catchment=row_dict["divide_id"],
-            smcmax={"value": row_dict["smcmax_avg"], "units": "m/m"},
-            b={"value": row_dict["bexp_avg"], "units": None},
-            satpsi={"value": row_dict["psisat_avg"], "units": "m"},
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            smcmax={"value": row_dict[attr_names.SMCMAX.value], "units": "m/m"},
+            b={"value": row_dict[attr_names.BEXP.value], "units": None},
+            satpsi={"value": row_dict[attr_names.PSISAT.value], "units": "m"},
             soil_storage_model=soil_storage_model,
             soil_storage_depth=soil_storage_depth,
             water_table_based_method=water_table_based_method,
@@ -302,7 +335,9 @@ def get_smp_parameters(
     return pydantic_models
 
 
-def get_lstm_parameters(catalog: Catalog, namespace: str, identifier: str, graph: rx.PyDiGraph) -> list[LSTM]:
+def get_lstm_parameters(
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, graph: rx.PyDiGraph
+) -> list[LSTM]:
     """Creates the initial parameter estimates for the LSTM module
 
     Parameters
@@ -322,63 +357,47 @@ def get_lstm_parameters(catalog: Catalog, namespace: str, identifier: str, graph
     *Note: Per HF API, the following attributes for LSTM does not carry any relvant information:
     'train_cfg_file' & basin_name' -- remove if desire
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {
-        "slope": "mean.slope",
-        "elevation_mean": "mean.elevation",
-        "lat": "centroid_y",
-        "lon": "centroid_x",
-    }
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
     # Extraction of relevant features from divide attributes layer
     # & convert to polar
-    divide_attr_df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]
-    for param_name, prefix in attr.items():
-        # Extract only the relevant attribute(s)
-        matching_cols = [col for col in divide_attr_df.columns if col == prefix]
-        if matching_cols:
-            expressions.append(pl.concat([pl.col(col) for col in matching_cols]).alias(f"{param_name}"))
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}"))
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
 
-    divide_attr_df = divide_attr_df.select(expressions)
+    attr_names = select_attr_names(namespace)
 
-    # Extraction of relevant features from divides layer
-    divides_df = gauge["divides"][["divide_id", "areasqkm"]]
+    # Run HF2.2 specific items
+    if not namespace.is_nhf:
+        # Get divide area from divides layer
+        divides_df = gauge["divides"][[attr_names.DIVIDE_ID.value, attr_names.AREA.value]]
+        divide_attr_df = pd.merge(divide_attr_df, divides_df, on=attr_names.DIVIDE_ID.value, how="left")
 
-    # Ensure final result aligns properly based on each instances divide ids
-    result_df = pd.merge(divide_attr_df.to_pandas(), divides_df, on="divide_id", how="left")
+        # Convert elevation from cm to m
+        divide_attr_df[attr_names.ELEVATION.value] = divide_attr_df[attr_names.ELEVATION.value] * 0.01
 
-    # Convert elevation from cm to m
-    result_df["elevation_mean"] = result_df["elevation_mean"] * 0.01
-
-    # Convert CRS to WGS84 (EPSG4326)
-    crs = gauge["divides"].crs
-    transformer = Transformer.from_crs(crs, 4326)
-    wgs84_latlon = transformer.transform(result_df["lon"], result_df["lat"])
-    result_df["lat"] = wgs84_latlon[0]
-    result_df["lon"] = wgs84_latlon[1]
+        # Convert CRS to WGS84 (EPSG4326)
+        crs = gauge["divides"].crs
+        transformer = Transformer.from_crs(crs, 4326)
+        wgs84_latlon = transformer.transform(
+            divide_attr_df[attr_names.X.value], divide_attr_df[attr_names.Y.value]
+        )
+        divide_attr_df[attr_names.Y.value] = wgs84_latlon[0]
+        divide_attr_df[attr_names.X.value] = wgs84_latlon[1]
 
     pydantic_models = []
-    for _, row_dict in result_df.iterrows():
+    for _, row_dict in divide_attr_df.iterrows():
         # Instantiate the Pydantic model for each row
         model_instance = LSTM(
-            catchment=row_dict["divide_id"],
-            area_sqkm=row_dict["areasqkm"],
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            area_sqkm=row_dict[attr_names.AREA.value],
             basin_id=identifier,
-            elev_mean=row_dict["elevation_mean"],
-            lat=row_dict["lat"],
-            lon=row_dict["lon"],
-            slope_mean=row_dict["slope"],
+            elev_mean=row_dict[attr_names.ELEVATION.value],
+            lat=row_dict[attr_names.Y.value],
+            lon=row_dict[attr_names.X.value],
+            slope_mean=row_dict[attr_names.SLOPE.value],
         )
         pydantic_models.append(model_instance)
     return pydantic_models
@@ -386,7 +405,7 @@ def get_lstm_parameters(catalog: Catalog, namespace: str, identifier: str, graph
 
 def get_lasam_parameters(
     catalog: Catalog,
-    namespace: str,
+    namespace: HydrofabricNamespace,
     identifier: str,
     sft_included: bool,
     graph: rx.PyDiGraph,
@@ -413,38 +432,25 @@ def get_lasam_parameters(
     list[LASAM]
         The list of all initial parameters for catchments using LASAM
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {"soil_type": "mode.ISLTYP"}
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
     # Extraction of relevant features from divide attributes layer
     # & convert to polar
-    divide_attr_df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]
-    for param_name, prefix in attr.items():
-        # Extract only the relevant attribute(s)
-        matching_cols = [col for col in divide_attr_df.columns if col == prefix]
-        if matching_cols:
-            expressions.append(pl.concat([pl.col(col) for col in matching_cols]).alias(f"{param_name}"))
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}"))
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
 
-    result_df = divide_attr_df.select(expressions)
+    attr_names = select_attr_names(namespace)
 
     pydantic_models = []
-    for row_dict in result_df.iter_rows(named=True):
+    for _, row_dict in divide_attr_df.iterrows():
         # Instantiate the Pydantic model for each row
         model_instance = LASAM(
-            catchment=row_dict["divide_id"],
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
             soil_params_file=soil_params_file,  # TODO figure out why this exists?
-            layer_soil_type=str(row_dict["soil_type"]),
+            layer_soil_type=str(row_dict[attr_names.ISLTYP.value]),
             sft_coupled=sft_included,
         )
         pydantic_models.append(model_instance)
@@ -452,7 +458,7 @@ def get_lasam_parameters(
 
 
 def get_noahowp_parameters(
-    catalog: Catalog, namespace: str, identifier: str, graph: rx.PyDiGraph
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, graph: rx.PyDiGraph
 ) -> list[NoahOwpModular]:
     """Creates the initial parameter estimates for the Noah OWP Modular module
 
@@ -470,64 +476,47 @@ def get_noahowp_parameters(
     list[NoahOwpModular]
         The list of all initial parameters for catchments using NoahOwpModular
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {
-        "slope": "mean.slope",
-        "aspect": "circ_mean.aspect",
-        "lat": "centroid_y",
-        "lon": "centroid_x",
-        "soil_type": "mode.ISLTYP",
-        "veg_type": "mode.IVGTYP",
-    }
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
     # Extraction of relevant features from divide attributes layer
     # & convert to polar
-    divide_attr_df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]
-    for param_name, prefix in attr.items():
-        # Extract only the relevant attribute(s)
-        matching_cols = [col for col in divide_attr_df.columns if col == prefix]
-        if matching_cols:
-            expressions.append(pl.concat([pl.col(col) for col in matching_cols]).alias(f"{param_name}"))
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}"))
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
 
-    result_df = divide_attr_df.select(expressions).to_pandas()
+    attr_names = select_attr_names(namespace)
 
-    # Convert CRS to WGS84 (EPSG4326)
-    crs = gauge["divides"].crs
-    transformer = Transformer.from_crs(crs, 4326)
-    wgs84_latlon = transformer.transform(result_df["lon"], result_df["lat"])
-    result_df["lon"] = wgs84_latlon[0]
-    result_df["lat"] = wgs84_latlon[1]
+    # Convert CRS to WGS84 (EPSG4326) for HF2.2
+    if not namespace.is_nhf:
+        crs = gauge["divides"].crs
+        transformer = Transformer.from_crs(crs, 4326)
+        wgs84_latlon = transformer.transform(
+            divide_attr_df[attr_names.X.value], divide_attr_df[attr_names.Y.value]
+        )
+        divide_attr_df[attr_names.Y.value] = wgs84_latlon[0]
+        divide_attr_df[attr_names.X.value] = wgs84_latlon[1]
 
     pydantic_models = []
-    for _, row_dict in result_df.iterrows():
+    for _, row_dict in divide_attr_df.iterrows():
         # Instantiate the Pydantic model for each row
         model_instance = NoahOwpModular(
-            catchment=row_dict["divide_id"],
-            lat=row_dict["lat"],
-            lon=row_dict["lon"],
-            terrain_slope=row_dict["slope"],
-            azimuth=row_dict["aspect"],
-            isltyp=row_dict["soil_type"],
-            vegtyp=row_dict["veg_type"],
-            sfctyp=2 if row_dict["veg_type"] == 16 else 1,
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            lat=row_dict[attr_names.Y.value],
+            lon=row_dict[attr_names.X.value],
+            terrain_slope=row_dict[attr_names.SLOPE.value],
+            azimuth=row_dict[attr_names.ASPECT.value],
+            isltyp=row_dict[attr_names.ISLTYP.value],
+            vegtyp=row_dict[attr_names.IVGTYP.value],
+            sfctyp=2 if row_dict[attr_names.IVGTYP.value] == 16 else 1,
         )
         pydantic_models.append(model_instance)
     return pydantic_models
 
 
 def get_sacsma_parameters(
-    catalog: Catalog, namespace: str, identifier: str, envca: bool, graph: rx.PyDiGraph
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, envca: bool, graph: rx.PyDiGraph
 ) -> list[SacSma]:
     """Creates the initial parameter estimates for the SAC SMA module
 
@@ -548,60 +537,46 @@ def get_sacsma_parameters(
     list[SacSma]
         The list of all initial parameters for catchments using SacSma
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
+
+    attr_names = select_attr_names(namespace)
 
     # Extraction of relevant features from divides layer
     pd.options.mode.chained_assignment = None
-    result_df = gauge["divides"][["divide_id", "areasqkm"]]
 
-    # Default parameter values used only for CONUS
-    result_df["uztwm"] = SacSmaValues.UZTWM.value
-    result_df["uzfwm"] = SacSmaValues.UZFWM.value
-    result_df["lztwm"] = SacSmaValues.LZTWM.value
-    result_df["lzfpm"] = SacSmaValues.LZFPM.value
-    result_df["lzfsm"] = SacSmaValues.LZFSM.value
-    result_df["adimp"] = SacSmaValues.ADIMP.value
-    result_df["uzk"] = SacSmaValues.UZK.value
-    result_df["lzpk"] = SacSmaValues.LZPK.value
-    result_df["lzsk"] = SacSmaValues.LZSK.value
-    result_df["zperc"] = SacSmaValues.ZPERC.value
-    result_df["rexp"] = SacSmaValues.REXP.value
-    result_df["pctim"] = SacSmaValues.PCTIM.value
-    result_df["pfree"] = SacSmaValues.PFREE.value
-    result_df["riva"] = SacSmaValues.RIVA.value
-    result_df["side"] = SacSmaValues.SIDE.value
-    result_df["rserv"] = SacSmaValues.RSERV.value
+    if namespace.is_nhf:
+        result_df = pd.DataFrame(gauge["divides"])
+    else:
+        result_df = gauge["divides"][[attr_names.DIVIDE_ID.value, attr_names.AREA.value]]
+        if not envca:
+            divides_list = result_df[attr_names.DIVIDE_ID.value]
+            domain = namespace.split("_")[0]
+            table_name = f"divide_parameters.sac-sma_{domain}"
+            params_df = catalog.load_table(table_name).to_polars()
+            conus_param_df = (
+                params_df.filter(pl.col(attr_names.DIVIDE_ID.value).is_in(divides_list)).collect().to_pandas()
+            )
+            result_df = pd.merge(conus_param_df, result_df, on=attr_names.DIVIDE_ID.value, how="left")
+        else:
+            result_df["uztwm"] = SacSmaValues.UZTWM.value
+            result_df["uzfwm"] = SacSmaValues.UZFWM.value
+            result_df["lztwm"] = SacSmaValues.LZTWM.value
+            result_df["lzfpm"] = SacSmaValues.LZFPM.value
+            result_df["lzfsm"] = SacSmaValues.LZFSM.value
+            result_df["adimp"] = SacSmaValues.ADIMP.value
+            result_df["uzk"] = SacSmaValues.UZK.value
+            result_df["lzpk"] = SacSmaValues.LZPK.value
+            result_df["lzsk"] = SacSmaValues.LZSK.value
+            result_df["zperc"] = SacSmaValues.ZPERC.value
+            result_df["rexp"] = SacSmaValues.REXP.value
+            result_df["pctim"] = SacSmaValues.PCTIM.value
+            result_df["pfree"] = SacSmaValues.PFREE.value
+            result_df["riva"] = SacSmaValues.RIVA.value
+            result_df["side"] = SacSmaValues.SIDE.value
+            result_df["rserv"] = SacSmaValues.RSERV.value
 
-    if namespace == "conus_hf" and not envca:
-        divides_list = result_df["divide_id"]
-        domain = namespace.split("_")[0]
-        table_name = f"divide_parameters.sac-sma_{domain}"
-        params_df = catalog.load_table(table_name).to_polars()
-        conus_param_df = params_df.filter(pl.col("divide_id").is_in(divides_list)).collect().to_pandas()
-        result_df.drop(
-            columns=[
-                "uztwm",
-                "uzfwm",
-                "lztwm",
-                "lzfpm",
-                "lzfsm",
-                "uzk",
-                "lzpk",
-                "lzsk",
-                "zperc",
-                "rexp",
-                "pfree",
-            ],
-            inplace=True,
-        )
-        result_df = pd.merge(conus_param_df, result_df, on="divide_id", how="left")
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    result_df = result_df.replace({np.nan: None})
 
     pydantic_models = []
     for _, row_dict in result_df.iterrows():
@@ -609,27 +584,27 @@ def get_sacsma_parameters(
         # *Note: The HF API declares hru_id as the divide id, but to remain consistent
         # keeping catchment arg.
         model_instance = SacSma(
-            catchment=row_dict["divide_id"],
-            hru_id=row_dict["divide_id"],
-            hru_area=row_dict["areasqkm"],
-            uztwm=row_dict["uztwm"],
-            uzfwm=row_dict["uzfwm"],
-            lztwm=row_dict["lztwm"],
-            lzfpm=row_dict["lzfpm"],
-            lzfsm=row_dict["lzfsm"],
-            uzk=row_dict["uzk"],
-            lzpk=row_dict["lzpk"],
-            lzsk=row_dict["lzsk"],
-            zperc=row_dict["zperc"],
-            rexp=row_dict["rexp"],
-            pfree=row_dict["pfree"],
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            hru_id=row_dict[attr_names.DIVIDE_ID.value],
+            hru_area=row_dict[attr_names.AREA.value],
+            uztwm=row_dict[attr_names.UZTWM.value],
+            uzfwm=row_dict[attr_names.UZFWM.value],
+            lztwm=row_dict[attr_names.LZTWM.value],
+            lzfpm=row_dict[attr_names.LZFPM.value],
+            lzfsm=row_dict[attr_names.LZFSM.value],
+            uzk=row_dict[attr_names.UZK.value],
+            lzpk=row_dict[attr_names.LZPK.value],
+            lzsk=row_dict[attr_names.LZSK.value],
+            zperc=row_dict[attr_names.ZPERC.value],
+            rexp=row_dict[attr_names.REXP.value],
+            pfree=row_dict[attr_names.PFREE.value],
         )
         pydantic_models.append(model_instance)
     return pydantic_models
 
 
 def get_troute_parameters(
-    catalog: Catalog, namespace: str, identifier: str, graph: rx.PyDiGraph
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, graph: rx.PyDiGraph
 ) -> list[TRoute]:
     """Creates the initial parameter estimates for the T-Route
 
@@ -645,34 +620,22 @@ def get_troute_parameters(
     Returns
     -------
     list[TRoute]
-        The list of all initial parameters for catchments using TRoute
+        The list of TRoute parameters for the gauge.
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
+    pydantic_models = TRoute()
 
-    # Extraction of relevant features from divide attributes layer
-    divide_attr_df = pd.DataFrame(gauge["divide-attributes"])
-    nwtopo_param = collections.defaultdict(dict)
-    nwtopo_param["supernetwork_parameters"].update({"geo_file_path": f"gauge_{identifier}.gpkg"})
-    nwtopo_param["waterbody_parameters"].update(
-        {"level_pool": {"level_pool_waterbody_parameter_file_path": f"gauge_{identifier}.gpkg"}}
-    )
+    # Add geopackage filename
+    gpkg_string = f"hydrofabric_subset_{identifier}_site_no.gpkg"
+    pydantic_models.network_topology_parameters["supernetwork_parameters"]["geo_file_path"] = gpkg_string
+    pydantic_models.network_topology_parameters["waterbody_parameters"]["level_pool"][
+        "level_pool_waterbody_parameter_file_path"
+    ] = gpkg_string
 
-    pydantic_models = []
-    for _, row_dict in divide_attr_df.iterrows():
-        model_instance = TRoute(catchment=row_dict["divide_id"], nwtopo_param=nwtopo_param)
-        pydantic_models.append(model_instance)
-    return pydantic_models
+    return [pydantic_models]
 
 
 def get_topmodel_parameters(
-    catalog: Catalog, namespace: str, identifier: str, graph: rx.PyDiGraph
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, graph: rx.PyDiGraph
 ) -> list[Topmodel]:
     """Creates the initial parameter estimates for the Topmodel
 
@@ -699,53 +662,55 @@ def get_topmodel_parameters(
     - The divide_id is the same as catchment, but will return divide_id variable name here
     since expected from HF API - remove if needed.
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {"twi": "dist_4.twi"}
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
     # Extraction of relevant features from divide attributes layer
     # & convert to polar
-    divide_attr_df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]
-    for param_name, prefix in attr.items():
-        # Extract only the relevant attribute(s)
-        matching_cols = [col for col in divide_attr_df.columns if col == prefix]
-        if matching_cols:
-            expressions.append(pl.concat([pl.col(col) for col in matching_cols]).alias(f"{param_name}"))
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}"))
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
 
-    divide_attr_df = divide_attr_df.select(expressions)
+    attr_names = select_attr_names(namespace)
 
-    # Extraction of relevant features from divides layer
-    divides_df = gauge["divides"][["divide_id", "lengthkm"]]
+    # Get flowpath length from divides layer for HF2.2 or from flowpaths layer in NHF
+    if namespace.is_nhf:
+        flowpaths_df = pd.DataFrame(gauge["flowpaths"])[
+            [attr_names.DIVIDE_ID.value, attr_names.FLOWPATH_LENGTH.value]
+        ]
+    else:
+        flowpaths_df = pd.DataFrame(gauge["divides"])[
+            [attr_names.DIVIDE_ID.value, attr_names.FLOWPATH_LENGTH.value]
+        ]
 
-    # Ensure final result aligns properly based on each instances divide ids
-    result_df = pd.merge(divide_attr_df.to_pandas(), divides_df, on="divide_id", how="left")
+    divide_attr_df = pd.merge(divide_attr_df, flowpaths_df, on=attr_names.DIVIDE_ID.value, how="left")
 
     pydantic_models = []
-    for _idx, row_dict in result_df.iterrows():
-        twi_json = json.loads(row_dict["twi"])
+    for _idx, row_dict in divide_attr_df.iterrows():
+        if namespace.is_nhf:
+            twi_json = [
+                {"v": row_dict[attr_names.TWI_Q25.value], "Frequency": "0.25"},
+                {"v": row_dict[attr_names.TWI_Q50.value], "Frequency": "0.25"},
+                {"v": row_dict[attr_names.TWI_Q75.value], "Frequency": "0.25"},
+                {"v": row_dict[attr_names.TWI_Q100.value], "Frequency": "0.25"},
+            ]
+        else:
+            twi_json = json.loads(row_dict[attr_names.TWI.value])
+
         model_instance = Topmodel(
-            catchment=row_dict["divide_id"],
-            divide_id=row_dict["divide_id"],
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            divide_id=row_dict[attr_names.DIVIDE_ID.value],
             twi=twi_json,
             num_topodex_values=len(twi_json),
-            dist_from_outlet=round(row_dict["lengthkm"] * 1000),
+            dist_from_outlet=round(row_dict[attr_names.FLOWPATH_LENGTH.value] * 1000),
         )
         pydantic_models.append(model_instance)
     return pydantic_models
 
 
 def get_topoflow_parameters(
-    catalog: Catalog, namespace: str, identifier: str, graph: rx.PyDiGraph
+    catalog: Catalog, namespace: HydrofabricNamespace, identifier: str, graph: rx.PyDiGraph
 ) -> list[Topoflow]:
     """Creates the initial parameter estimates for the Topoflow module
 
@@ -763,52 +728,46 @@ def get_topoflow_parameters(
     list[Topoflow]
         The list of all initial parameters for catchments using Topoflow
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
+
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
     )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
 
-    attrs = [
-        "divide_id",
-        "mean.slope",
-        "circ_mean.aspect",
-        "centroid_x",
-        "centroid_y",
-        "mean.elevation",
-        "glacier_percent",
-    ]
-    divide_attr_df = pd.DataFrame(gauge["divide-attributes"])
-    divide_attr_df = divide_attr_df[attrs]
-    divides_df = gauge["divides"][["divide_id", "areasqkm"]]
-    divide_attr_df = divide_attr_df.merge(divides_df, on="divide_id", how="left")
+    attr_names = select_attr_names(namespace)
 
-    # Convert elevation from cm to m
-    divide_attr_df["mean.elevation"] = divide_attr_df["mean.elevation"] * 0.01
+    # Run items specifically for HF2.2
+    if not namespace.is_nhf:
+        divides_df = gauge["divides"][[attr_names.DIVIDE_ID.value, attr_names.AREA.value]]
+        divide_attr_df = divide_attr_df.merge(divides_df, on=attr_names.DIVIDE_ID.value, how="left")
 
-    # Convert CRS to WGS84 (EPSG4326)
-    crs = gauge["divides"].crs
-    transformer = Transformer.from_crs(crs, 4326)
-    wgs84_latlon = transformer.transform(divide_attr_df["centroid_x"], divide_attr_df["centroid_y"])
-    divide_attr_df["centroid_y"] = wgs84_latlon[0]
-    divide_attr_df["centroid_x"] = wgs84_latlon[1]
+        # Convert elevation from cm to m
+        divide_attr_df[attr_names.ELEVATION.value] = divide_attr_df[attr_names.ELEVATION.value] * 0.01
+
+        # Convert CRS to WGS84 (EPSG4326)
+        crs = gauge["divides"].crs
+        transformer = Transformer.from_crs(crs, 4326)
+        wgs84_latlon = transformer.transform(
+            divide_attr_df[attr_names.X.value], divide_attr_df[attr_names.Y.value]
+        )
+        divide_attr_df[attr_names.Y.value] = wgs84_latlon[0]
+        divide_attr_df[attr_names.X.value] = wgs84_latlon[1]
 
     pydantic_models = []
     for _, row_dict in divide_attr_df.iterrows():
         # Instantiate the Pydantic model for each row
         model_instance = Topoflow(
-            site_prefix=row_dict["divide_id"],
-            forcing_file=f"data/{row_dict['divide_id']}.csv",
-            da=row_dict["areasqkm"],
-            slope=row_dict["mean.slope"],
-            aspect=row_dict["circ_mean.aspect"],
-            lon=row_dict["centroid_x"],
-            lat=row_dict["centroid_y"],
-            elev=row_dict["mean.elevation"],
-            glacier_percent=row_dict["glacier_percent"],
+            site_prefix=row_dict[attr_names.DIVIDE_ID.value],
+            forcing_file=f"data/{row_dict[attr_names.DIVIDE_ID.value]}.csv",
+            da=row_dict[attr_names.AREA.value],
+            slope=row_dict[attr_names.SLOPE.value],
+            aspect=row_dict[attr_names.ASPECT.value],
+            lon=row_dict[attr_names.X.value],
+            lat=row_dict[attr_names.Y.value],
+            elev=row_dict[attr_names.ELEVATION.value],
+            glacier_percent=row_dict[attr_names.GLACIER_PERCENT.value],
         )
         pydantic_models.append(model_instance)
     return pydantic_models
@@ -816,7 +775,7 @@ def get_topoflow_parameters(
 
 def get_ueb_parameters(
     catalog: Catalog,
-    namespace: str,
+    namespace: HydrofabricNamespace,
     identifier: str,
     envca: bool,
     graph: rx.PyDiGraph,
@@ -827,7 +786,7 @@ def get_ueb_parameters(
     ----------
     catalog : Catalog
         the pyiceberg lakehouse catalog
-    namespace : HydrofabricDomains
+    namespace : str
         the hydrofabric namespace
     identifier : str
         the gauge identifier
@@ -839,110 +798,100 @@ def get_ueb_parameters(
     list[UEB]
         The list of all initial parameters for catchments using UEB
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
-    attr = {
-        "slope": "mean.slope",
-        "aspect": "circ_mean.aspect",
-        "elevation": "mean.elevation",
-        "lat": "centroid_y",
-        "lon": "centroid_x",
-    }
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
     # Extraction of relevant features from divide attributes layer
     # & convert to polar
-    divide_attr_df = pl.DataFrame(gauge["divide-attributes"])
-    expressions = [pl.col("divide_id")]
-    for param_name, prefix in attr.items():
-        # Find all columns that start with the prefix
-        matching_cols = [col for col in divide_attr_df.columns if col == prefix]
-        if matching_cols:
-            expressions.append(pl.concat([pl.col(col) for col in matching_cols]).alias(f"{param_name}"))
-        else:
-            # Default to 0.0 if no matching columns found
-            expressions.append(pl.lit(0.0).alias(f"{param_name}"))
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
 
-    result_df = divide_attr_df.select(expressions).to_pandas()
+    attr_names = select_attr_names(namespace)
 
-    # Convert elevation from cm to m
-    result_df["elevation"] = result_df["elevation"] * 0.01
+    # Run items specifically for HF2.2
+    if not namespace.is_nhf:
+        # Convert elevation from cm to m
+        divide_attr_df[attr_names.ELEVATION.value] = divide_attr_df[attr_names.ELEVATION.value] * 0.01
 
-    # Convert CRS to WGS84 (EPSG4326)
-    crs = gauge["divides"].crs
-    transformer = Transformer.from_crs(crs, 4326)
-    wgs84_latlon = transformer.transform(result_df["lon"], result_df["lat"])
-    result_df["lon"] = wgs84_latlon[0]
-    result_df["lat"] = wgs84_latlon[1]
-
-    # Default parameter values
-    result_df["jan_temp_range"] = UEBValues.JAN_TEMP.value
-    result_df["feb_temp_range"] = UEBValues.FEB_TEMP.value
-    result_df["mar_temp_range"] = UEBValues.MAR_TEMP.value
-    result_df["apr_temp_range"] = UEBValues.APR_TEMP.value
-    result_df["may_temp_range"] = UEBValues.MAY_TEMP.value
-    result_df["jun_temp_range"] = UEBValues.JUN_TEMP.value
-    result_df["jul_temp_range"] = UEBValues.JUL_TEMP.value
-    result_df["aug_temp_range"] = UEBValues.AUG_TEMP.value
-    result_df["sep_temp_range"] = UEBValues.SEP_TEMP.value
-    result_df["oct_temp_range"] = UEBValues.OCT_TEMP.value
-    result_df["nov_temp_range"] = UEBValues.NOV_TEMP.value
-    result_df["dec_temp_range"] = UEBValues.DEC_TEMP.value
-
-    if namespace == "conus_hf" and not envca:
-        divides_list = result_df["divide_id"]
-        domain = namespace.split("_")[0]
-        table_name = f"divide_parameters.ueb_{domain}"
-        params_df = catalog.load_table(table_name).to_polars()
-        conus_param_df = params_df.filter(pl.col("divide_id").is_in(divides_list)).collect().to_pandas()
-        col2drop = [col for col in result_df.columns if col.endswith("_temp_range")]
-        result_df.drop(columns=col2drop, inplace=True)
-        result_df = pd.merge(conus_param_df, result_df, on="divide_id", how="left")
-        result_df.rename(
-            columns={
-                "b01": "jan_temp_range",
-                "b02": "feb_temp_range",
-                "b03": "mar_temp_range",
-                "b04": "apr_temp_range",
-                "b05": "may_temp_range",
-                "b06": "jun_temp_range",
-                "b07": "jul_temp_range",
-                "b08": "aug_temp_range",
-                "b09": "sep_temp_range",
-                "b10": "oct_temp_range",
-                "b11": "nov_temp_range",
-                "b12": "dec_temp_range",
-            },
-            inplace=True,
+        # Convert CRS to WGS84 (EPSG4326)
+        crs = gauge["divides"].crs
+        transformer = Transformer.from_crs(crs, 4326)
+        wgs84_latlon = transformer.transform(
+            divide_attr_df[attr_names.X.value], divide_attr_df[attr_names.Y.value]
         )
+        divide_attr_df[attr_names.Y.value] = wgs84_latlon[0]
+        divide_attr_df[attr_names.X.value] = wgs84_latlon[1]
+
+        # Get temperature values from Iceberg tables
+        if not envca:
+            divides_list = divide_attr_df[attr_names.DIVIDE_ID.value]
+            domain = namespace.split("_")[0]
+            table_name = f"divide_parameters.ueb_{domain}"
+            params_df = catalog.load_table(table_name).to_polars()
+            conus_param_df = (
+                params_df.filter(pl.col(attr_names.DIVIDE_ID.value).is_in(divides_list)).collect().to_pandas()
+            )
+            col2drop = [col for col in divide_attr_df.columns if col.endswith("_temp_range")]
+            divide_attr_df.drop(columns=col2drop, inplace=True)
+            divide_attr_df = pd.merge(
+                conus_param_df, divide_attr_df, on=attr_names.DIVIDE_ID.value, how="left"
+            )
+            divide_attr_df.rename(
+                columns={
+                    "b01": "jan_temp_range",
+                    "b02": "feb_temp_range",
+                    "b03": "mar_temp_range",
+                    "b04": "apr_temp_range",
+                    "b05": "may_temp_range",
+                    "b06": "jun_temp_range",
+                    "b07": "jul_temp_range",
+                    "b08": "aug_temp_range",
+                    "b09": "sep_temp_range",
+                    "b10": "oct_temp_range",
+                    "b11": "nov_temp_range",
+                    "b12": "dec_temp_range",
+                },
+                inplace=True,
+            )
+        else:
+            # Default parameter values
+            divide_attr_df["jan_temp_range"] = UEBValues.JAN_TEMP.value
+            divide_attr_df["feb_temp_range"] = UEBValues.FEB_TEMP.value
+            divide_attr_df["mar_temp_range"] = UEBValues.MAR_TEMP.value
+            divide_attr_df["apr_temp_range"] = UEBValues.APR_TEMP.value
+            divide_attr_df["may_temp_range"] = UEBValues.MAY_TEMP.value
+            divide_attr_df["jun_temp_range"] = UEBValues.JUN_TEMP.value
+            divide_attr_df["jul_temp_range"] = UEBValues.JUL_TEMP.value
+            divide_attr_df["aug_temp_range"] = UEBValues.AUG_TEMP.value
+            divide_attr_df["sep_temp_range"] = UEBValues.SEP_TEMP.value
+            divide_attr_df["oct_temp_range"] = UEBValues.OCT_TEMP.value
+            divide_attr_df["nov_temp_range"] = UEBValues.NOV_TEMP.value
+            divide_attr_df["dec_temp_range"] = UEBValues.DEC_TEMP.value
 
     pydantic_models = []
-    for _, row_dict in result_df.iterrows():
+    for _, row_dict in divide_attr_df.iterrows():
         model_instance = UEB(
-            catchment=row_dict["divide_id"],
-            aspect=row_dict["aspect"],
-            slope=row_dict["slope"],
-            longitude=row_dict["lon"],
-            latitude=row_dict["lat"],
-            elevation=row_dict["elevation"],
-            standard_atm_pressure=round(Atmosphere(row_dict["elevation"]).pressure[0], 4),
-            jan_temp_range=row_dict["jan_temp_range"],
-            feb_temp_range=row_dict["feb_temp_range"],
-            mar_temp_range=row_dict["mar_temp_range"],
-            apr_temp_range=row_dict["apr_temp_range"],
-            may_temp_range=row_dict["may_temp_range"],
-            jun_temp_range=row_dict["jun_temp_range"],
-            jul_temp_range=row_dict["jul_temp_range"],
-            aug_temp_range=row_dict["aug_temp_range"],
-            sep_temp_range=row_dict["sep_temp_range"],
-            oct_temp_range=row_dict["oct_temp_range"],
-            nov_temp_range=row_dict["nov_temp_range"],
-            dec_temp_range=row_dict["dec_temp_range"],
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            aspect=row_dict[attr_names.ASPECT.value],
+            slope=row_dict[attr_names.SLOPE.value],
+            longitude=row_dict[attr_names.X.value],
+            latitude=row_dict[attr_names.Y.value],
+            elevation=row_dict[attr_names.ELEVATION.value],
+            standard_atm_pressure=round(Atmosphere(row_dict[attr_names.ELEVATION.value]).pressure[0], 4),
+            jan_temp_range=row_dict[attr_names.JAN.value],
+            feb_temp_range=row_dict[attr_names.FEB.value],
+            mar_temp_range=row_dict[attr_names.MAR.value],
+            apr_temp_range=row_dict[attr_names.APR.value],
+            may_temp_range=row_dict[attr_names.MAY.value],
+            jun_temp_range=row_dict[attr_names.JUN.value],
+            jul_temp_range=row_dict[attr_names.JUL.value],
+            aug_temp_range=row_dict[attr_names.AUG.value],
+            sep_temp_range=row_dict[attr_names.SEP.value],
+            oct_temp_range=row_dict[attr_names.OCT.value],
+            nov_temp_range=row_dict[attr_names.NOV.value],
+            dec_temp_range=row_dict[attr_names.DEC.value],
         )
         pydantic_models.append(model_instance)
     return pydantic_models
@@ -950,10 +899,10 @@ def get_ueb_parameters(
 
 def get_cfe_parameters(
     catalog: Catalog,
-    namespace: str,
+    namespace: HydrofabricNamespace,
     identifier: str,
     cfe_version: str,
-    graph: rx.PyDiGraph,
+    graph: rx.PyDiGraph | None = None,
     sft_included: bool = False,
     rootzone_aet: bool = False,
 ) -> list[CFE]:
@@ -963,7 +912,7 @@ def get_cfe_parameters(
     ----------
     catalog : Catalog
         the pyiceberg lakehouse catalog
-    namespace : HydrofabricDomains
+    namespace : str
         the hydrofabric namespace
     identifier : str
         the gauge identifier
@@ -980,28 +929,32 @@ def get_cfe_parameters(
     list[CFE]
         The list of all initial parameters for catchments using CFE
     """
-    gauge: dict[str, pd.DataFrame | gpd.GeoDataFrame] = subset_hydrofabric(
-        catalog=catalog,
-        identifier=identifier,
-        id_type=IdType.HL_URI,
-        namespace=namespace,
-        layers=["flowpaths", "nexus", "divides", "divide-attributes", "network"],
-        graph=graph,
-    )
+    gauge = get_subset(catalog=catalog, identifier=identifier, namespace=namespace, graph=graph)
 
-    # CFE
-    df = pd.DataFrame(gauge["divide-attributes"])
-    divides_list = df["divide_id"]
-    domain = namespace.split("_")[0]
-    table_name = f"divide_parameters.cfe-x_{domain}"
-    params_df = catalog.load_table(table_name).to_polars()
-    conus_param_df = params_df.filter(pl.col("divide_id").is_in(divides_list)).collect().to_pandas()
-    df = pd.merge(conus_param_df, df, on="divide_id", how="left")
+    divide_attr_df = (
+        pd.DataFrame(gauge["divide-attributes"]) if not namespace.is_nhf else pd.DataFrame(gauge["divides"])
+    )
+    # Replace any NaNs in dataframe with None so it can be converted to JSON by FastAPI
+    divide_attr_df = divide_attr_df.replace({np.nan: None})
+    attr_names = select_attr_names(namespace)
+    divides_list = divide_attr_df[attr_names.DIVIDE_ID.value]
+
+    if not namespace.is_nhf:
+        domain = namespace.split("_")[0]
+        table_name = f"divide_parameters.cfe-x_{domain}"
+        params_df = catalog.load_table(table_name).to_polars()
+        conus_param_df = (
+            params_df.filter(pl.col(attr_names.DIVIDE_ID.value).is_in(divides_list)).collect().to_pandas()
+        )
+        divide_attr_df = pd.merge(conus_param_df, divide_attr_df, on=attr_names.DIVIDE_ID.value, how="left")
 
     if rootzone_aet:
         is_aet_rootzone = True
         soil_layer_depths = {"value": CFEValues.SOIL_LAYER_DEPTHS.value, "units": CFEUnits.SOIL_DEPTH.value}
-        max_rootzone_layer = {"value": CFEValues.MAX_ROOTZONE_LAYER.value, "units": CFEUnits.MAX_ROOTZONE_LAYER.value}
+        max_rootzone_layer = {
+            "value": CFEValues.MAX_ROOTZONE_LAYER.value,
+            "units": CFEUnits.MAX_ROOTZONE_LAYER.value,
+        }
     else:
         is_aet_rootzone = False
         soil_layer_depths = None
@@ -1023,7 +976,10 @@ def get_cfe_parameters(
         x_Xinanjiang_shape_parameter = None
         if sft_included:
             is_sft_coupled = True
-            ice_content_thresh = {"value": CFEValues.ICE_CONTENT_THR.value, "units": CFEUnits.ICE_CONTENT_THR.value}
+            ice_content_thresh = {
+                "value": CFEValues.ICE_CONTENT_THR.value,
+                "units": CFEUnits.ICE_CONTENT_THR.value,
+            }
         else:
             is_sft_coupled = False
             ice_content_thresh = None
@@ -1031,57 +987,63 @@ def get_cfe_parameters(
         raise ValueError(f"Passing unsupported cfe_version into endpoint: {cfe_version}")
 
     pydantic_models = []
-    for _, row_dict in df.iterrows():
+    for _, row_dict in divide_attr_df.iterrows():
         # Instantiate the Pydantic model for each row
         if cfe_version == "CFE-X":
             a_Xinanjiang_inflection_point_parameter = {
-                "value": row_dict["a_Xinanjiang_inflection_point_parameter"],
+                "value": row_dict[attr_names.AXAJ.value],
                 "units": CFEUnits.A_XINANJIANG_INFLECT.value,
             }
             b_Xinanjiang_shape_parameter = {
-                "value": row_dict["b_Xinanjiang_shape_parameter"],
+                "value": row_dict[attr_names.BXAJ.value],
                 "units": CFEUnits.B_XINANJIANG_SHAPE.value,
             }
             x_Xinanjiang_shape_parameter = {
-                "value": row_dict["x_Xinanjiang_shape_parameter"],
+                "value": row_dict[attr_names.XXAJ.value],
                 "units": CFEUnits.X_XINANJIANG_SHAPE.value,
             }
             urban_decimal_fraction = {
-                "value": row_dict["mean.impervious"],
+                "value": row_dict[attr_names.IMPERVIOUS.value],
                 "units": CFEUnits.URBAN_FRACT.value,
             }
 
         model_instance = CFE(
-            catchment=row_dict["divide_id"],
-            surface_partitioning_scheme=surface_partitioning_scheme,
+            catchment=row_dict[attr_names.DIVIDE_ID.value],
+            surface_water_partitioning_scheme=surface_partitioning_scheme,
             is_sft_coupled=str(is_sft_coupled),
-            ice_content_thresh=ice_content_thresh,
-            soil_params_b={"value": row_dict["mode.bexp_soil_layers_stag=1"], "units": CFEUnits.SOIL_B.value},
+            ice_content_threshold=ice_content_thresh,
+            soil_params_b={"value": row_dict[attr_names.BEXP.value], "units": CFEUnits.SOIL_B.value},
             soil_params_satdk={
-                "value": row_dict["geom_mean.dksat_soil_layers_stag=1"],
+                "value": row_dict[attr_names.DKSAT.value],
                 "units": CFEUnits.SOIL_SATDK.value,
             },
             soil_params_satpsi={
-                "value": row_dict["geom_mean.psisat_soil_layers_stag=1"],
+                "value": row_dict[attr_names.PSISAT.value],
                 "units": CFEUnits.SOIL_SATPSI.value,
             },
-            soil_params_slop={"value": row_dict["mean.slope_1km"], "units": CFEUnits.SOIL_SLOP.value},
+            soil_params_slop={
+                "value": row_dict[attr_names.SLOPE_1KM.value],
+                "units": CFEUnits.SOIL_SLOP.value,
+            },
             soil_params_smcmax={
-                "value": row_dict["mean.smcmax_soil_layers_stag=1"],
+                "value": row_dict[attr_names.SMCMAX.value],
                 "units": CFEUnits.SOIL_SMCMAX.value,
             },
             soil_params_wltsmc={
-                "value": row_dict["mean.smcwlt_soil_layers_stag=1"],
+                "value": row_dict[attr_names.SMCWLT.value],
                 "units": CFEUnits.SOIL_WLTSMC.value,
             },
-            max_gw_storage={"value": row_dict["mean.Zmax"], "units": CFEUnits.MAX_GIUH_STORAGE.value},
-            Cgw={"value": row_dict["mean.Coeff"], "units": CFEUnits.EXPON.value},
-            expon={"value": row_dict["mode.Expon"], "units": CFEUnits.EXPON.value},
+            max_gw_storage={
+                "value": row_dict[attr_names.ZMAX.value],
+                "units": CFEUnits.MAX_GW_STORAGE.value,
+            },
+            Cgw={"value": row_dict[attr_names.COEFF.value], "units": CFEUnits.CGW.value},
+            expon={"value": row_dict[attr_names.EXPON.value], "units": CFEUnits.EXPON.value},
             a_Xinanjiang_inflection_point_parameter=a_Xinanjiang_inflection_point_parameter,
             b_Xinanjiang_shape_parameter=b_Xinanjiang_shape_parameter,
             x_Xinanjiang_shape_parameter=x_Xinanjiang_shape_parameter,
             urban_decimal_fraction=urban_decimal_fraction,
-            refkdt={"value": row_dict["mean.refkdt"], "units": CFEUnits.REFKDT.value},
+            refkdt={"value": row_dict[attr_names.REFKDT.value], "units": CFEUnits.REFKDT.value},
             is_aet_rootzone=is_aet_rootzone,
             soil_layer_depths=soil_layer_depths,
             max_rootzone_layer=max_rootzone_layer,

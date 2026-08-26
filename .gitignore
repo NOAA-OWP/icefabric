@@ -138,6 +138,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local testing scripts
+.*.py
+
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -147,6 +150,7 @@ venv.bak/
 
 # mkdocs documentation
 /site
+static/
 
 # mypy
 .mypy_cache/
@@ -220,3 +224,4 @@ data/*
 .Rdata
 .Rhistory
 icefabric.Rproj
+docs/api_schema.json

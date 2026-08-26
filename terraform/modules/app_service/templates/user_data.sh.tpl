@@ -89,7 +89,7 @@ apt-get install -y \
     collectd systemd-timesyncd net-tools \
     realmd sssd sssd-tools libnss-sss libpam-sss \
     adcli samba-common-bin oddjob oddjob-mkhomedir \
-    packagekit krb5-user
+    packagekit krb5-user docker-compose-v2
 
 # === Configure Kerberos ===
 cat > /etc/krb5.conf <<EOF
@@ -112,29 +112,15 @@ cat > /etc/krb5.conf <<EOF
     $DOMAIN_NAME = $REALM_NAME
 EOF
 
-# === Install Docker ===
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-wait_for_apt_lock
-apt-get update -y
-wait_for_apt_lock
-apt-get install -y docker-ce docker-ce-cli containerd.io
-
-# === Docker Compose v2 ===
-curl -sSL "https://github.com/docker/compose/releases/download/v2.23.0/docker-compose-$(uname -s)-$(uname -m)" \
-  -o /usr/local/bin/docker-compose
-chmod +x /usr/local/bin/docker-compose
-
-# === Start Docker ===
-systemctl enable docker
-systemctl start docker
-
 # === CloudWatch Agent ===
 wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
 dpkg -i -E amazon-cloudwatch-agent.deb
 
 cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
 {
+  "agent": {
+    "run_as_user": "root"
+  },
   "metrics": {
     "namespace": "System/Linux",
     "metrics_collected": {
@@ -143,6 +129,20 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
           {"name": "mem_used_percent", "rename": "MemoryUtilization"}
         ],
         "metrics_collection_interval": 60
+      }
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/opt/icefabric/logs/icefabric.log",
+            "log_group_name": "${log_group_name}",
+            "log_stream_name": "{instance_id}",
+            "timezone": "UTC"
+          }
+        ]
       }
     }
   }
@@ -238,16 +238,21 @@ getent passwd "$AD_USER@$DOMAIN_NAME" || echo "SSSD user lookup failed"
 
 echo "Domain join and configuration complete"
 
-
 # === Setup Application Directory ===
-mkdir -p /opt/icefabric /opt/icefabric/logs
+mkdir -p /opt/icefabric /opt/icefabric/logs /opt/icefabric/nginx
+
+# === Write Nginx Configuration ===
+# Using 'EOF' with single quotes prevents bash from evaluating variables inside the block,
+# ensuring the raw Nginx config from Terraform is written exactly as-is.
+cat > /opt/icefabric/nginx/default.conf <<'EOF'
+${nginx_conf}
+EOF
 
 # === .env File for Compose ===
 cat > /opt/icefabric/.env <<EOF
-
 APP_HOST=0.0.0.0
 APP_PORT=8000
-RELOAD=true
+RELOAD=false
 CATALOG_PATH=glue
 LOG_DIR=/opt/icefabric/logs/
 AWS_DEFAULT_REGION=${aws_region}
@@ -258,24 +263,76 @@ EOF
 # === Docker Compose Application Stack ===
 cat > /opt/icefabric/docker-compose.yml <<EOF
 services:
-  myapp:
-    image: ${docker_image_uri}
-    network_mode: "host"
+  nginx:
+    image: ${nginx_image_uri}
+    container_name: icefabric-nginx-proxy
     ports:
-      - "8000:8000"
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+      - dashboard
+    restart: always
+
+  api:
+    image: ${api_image_uri}
+    container_name: icefabric-api
+    ports:
+      - "127.0.0.1:8000:8000"
     env_file:
       - ./.env
+    environment:
+      # Curb glibc per-thread arena fragmentation (heavy numpy/pandas use).
+      - MALLOC_ARENA_MAX=2
+      # Pin numerical libs + polars at 2 threads per worker. With 2 workers
+      # on a 4 vCPU box that's 4 active compute threads, matching vCPU
+      # count. Bump to 3 only if we reduce workers.
+      - OMP_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - POLARS_MAX_THREADS=2
+      # Hydrofabric subset concurrency guard. 1 per worker * 2 workers = 2
+      # concurrent heavy builds per EC2. This matches what our load test
+      # has validated safe on 16 GiB (peak 13.9 GiB / 87%). Bump to 2 only
+      # after a fresh RPM=60 load test confirms headroom at the new value.
+      - ICEFABRIC_HF_GPKG_CONCURRENCY=1
+      - ICEFABRIC_HF_GPKG_QUEUE_TIMEOUT_S=300
+      # Queue-depth admission. Once this many requests are already waiting
+      # for a semaphore slot, new requests get a 429 immediately instead of
+      # blocking for queue_timeout_s. 15 * ~15s per gpkg-limited request =
+      # ~225s worst-case wait, comfortably under the 300s queue timeout.
+      - ICEFABRIC_HF_GPKG_MAX_QUEUE_DEPTH=15
+      # Recycle each worker after N requests to reset memory creep
+      # from glibc arena / numpy allocator fragmentation. 100 gives a
+      # ~6-7 min recycle interval at RPM=15 (sustainable load), keeping
+      # RSS well under the 16 GiB ceiling even with the observed +46%
+      # mem creep over 20 min.
+      - ICEFABRIC_MAX_REQUESTS_PER_WORKER=100
+      # Disk-only result cache for hydrofabric gpkg subsets. Both workers
+      # share /tmp/hf_gpkg_cache; keys include the flowpaths snapshot id
+      # so deploys / table rewrites invalidate naturally. 250 entries fits
+      # 18 CONUS VPUs (~200 MB each, ~3.6 GiB) + ~230 gage slots (<5 MB
+      # each, ~1 GiB) with plenty of /tmp headroom on the root volume.
+      - ICEFABRIC_GPKG_CACHE_MAX_ENTRIES=250
     restart: always
-    volumes:
-      - /opt/icefabric/logs:/app/logs
-    command: /bin/bash -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 >> /app/logs/app.log 2>&1"
     healthcheck:
       test: ["CMD", "curl", "-f", "--head", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 60s
+
+  dashboard:
+    image: ${dashboard_image_uri}
+    container_name: icefabric-dashboard
+    ports:
+      - "127.0.0.1:8501:8501"
+    env_file:
+      - ./.env
+    restart: always
 EOF
+
 
 # === Compose Systemd Service ===
 cat > /etc/systemd/system/icefabric.service <<EOF
@@ -287,8 +344,8 @@ After=docker.service
 [Service]
 Restart=always
 WorkingDirectory=/opt/icefabric
-ExecStart=/usr/local/bin/docker-compose up
-ExecStop=/usr/local/bin/docker-compose down
+ExecStart=/bin/sh -c '/usr/bin/docker compose up >> /opt/icefabric/logs/icefabric.log 2>&1'
+ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=0
 
 [Install]

@@ -19,6 +19,7 @@ from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.expressions import And, EqualTo, GreaterThanOrEqual, In, LessThanOrEqual
 from pyprojroot import here
 
+from app import GpkgLimiter
 from app.main import app
 from icefabric.builds.graph_connectivity import read_edge_attrs, read_node_attrs
 from icefabric.schemas.icechunk import NGWPCTestLocations
@@ -198,14 +199,17 @@ class MockCatalog:
             "mock_hf.hydrolocations", self._create_hydrolocations_data()
         )
 
-        tables["divide_parameters.sac-sma_conus"] = MockTable(
-            "divide_parameters.sac-sma_conus", self._create_sac_sma_divide_parameters(network_data)
+        tables["divide_parameters.sac-sma_mock"] = MockTable(
+            "divide_parameters.sac-sma_mock", self._create_sac_sma_divide_parameters(network_data)
         )
-        tables["divide_parameters.snow-17_conus"] = MockTable(
-            "divide_parameters.snow-17_conus", self._create_snow17_divide_parameters(network_data)
+        tables["divide_parameters.snow-17_mock"] = MockTable(
+            "divide_parameters.snow-17_mock", self._create_snow17_divide_parameters(network_data)
         )
         tables["divide_parameters.cfe-x_mock"] = MockTable(
             "divide_parameters.cfe-x_mock", self._create_cfe_x_divide_parameters(network_data)
+        )
+        tables["divide_parameters.ueb_mock"] = MockTable(
+            "divide_parameters.ueb_mock", self._create_ueb_divide_parameters(network_data)
         )
 
         # Tables for Hydrofabric router testing
@@ -622,6 +626,33 @@ class MockCatalog:
 
         return pd.DataFrame(attributes)
 
+    def _create_ueb_divide_parameters(self, network_df: pd.DataFrame) -> pd.DataFrame:
+        """Create sample CFE-X divide parameters data matching CONUS schema"""
+        attributes = []
+        wb_records = network_df[network_df["id"].str.startswith("wb-", na=False)]
+
+        for _, row in wb_records.iterrows():
+            # Create realistic CFE-X parameters using hash for reproducible variation
+            attributes.append(
+                {
+                    "divide_id": row["divide_id"],  # StringType
+                    "jan_temp_range": 10,
+                    "feb_temp_range": 10,
+                    "mar_temp_range": 10,
+                    "apr_temp_range": 10,
+                    "may_temp_range": 10,
+                    "jun_temp_range": 10,
+                    "jul_temp_range": 10,
+                    "aug_temp_range": 10,
+                    "sep_temp_range": 10,
+                    "oct_temp_range": 10,
+                    "nov_temp_range": 10,
+                    "dec_temp_range": 10,
+                }
+            )
+
+        return pd.DataFrame(attributes)
+
     def _create_flowpath_attributes(self, flowpath_df: pd.DataFrame) -> pd.DataFrame:
         """Create sample flowpath attributes data matching schema"""
         attributes = []
@@ -967,7 +998,16 @@ def testing_dir() -> Path:
 @pytest.fixture(scope="session")
 def client():
     """Create a test client for the FastAPI app with mock catalog."""
+    import threading
+
     app.state.catalog = MockCatalog()  # defaulting to use the mock catalog
+    app.state.cached_namespaces = {"conus_hf", "ak_hf", "hi_hf", "prvi_hf"}
+    app.state.cache_catalog = MockCatalog()  # defaulting to use the mock catalog
+    # Tests skip lifespan; seed app.state manually.
+    app.state.gpkg_limiter = GpkgLimiter(
+        semaphore=threading.BoundedSemaphore(16),
+        queue_timeout_s=60.0,
+    )
     return TestClient(app)
 
 
