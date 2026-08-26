@@ -6,13 +6,13 @@ from app import get_catalog, get_graphs
 from icefabric.modules import SmpModules, config_mapper
 from icefabric.schemas import HydrofabricDomains
 from icefabric.schemas.modules import (
+    Albedo,
     LASAM,
     LSTM,
-    SFT,
-    SMP,
-    Albedo,
     NoahOwpModular,
     SacSma,
+    SFT,
+    SMP,
     Snow17,
     Topmodel,
     TRoute,
@@ -28,15 +28,6 @@ sacsma_router = APIRouter(prefix="/modules/sacsma")
 troute_router = APIRouter(prefix="/modules/troute")
 topmodel_router = APIRouter(prefix="/modules/topmodel")
 topoflow_router = APIRouter(prefix="/modules/topoflow")
-
-
-class SmpModules(str, Enum):
-    """Enum class for defining acceptable inputs for the SMP module variable"""
-
-    cfe_s = "CFE-S"
-    cfe_x = "CFE-X"
-    lasam = "LASAM"
-    topmodel = "TopModel"
 
 
 @sft_router.get("/", tags=["HF Modules"])

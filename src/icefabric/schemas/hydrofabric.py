@@ -22,6 +22,7 @@ class IdType(str, Enum):
     HF_ID = "hf_id"
     ID = "id"
     POI_ID = "poi_id"
+    VPU_ID = "vpu_id"
 
 
 class HydrofabricDomains(str, Enum):
@@ -46,6 +47,15 @@ class HydrofabricDomains(str, Enum):
     GL = "gl_hf"
     HI = "hi_hf"
     PRVI = "prvi_hf"
+
+
+class StreamflowDataSources(str, Enum):
+    """The data sources used for hourly streamflow data"""
+
+    USGS = "USGS"
+    ENVCA = "ENVCA"
+    CADWR = "CADWR"
+    TXDOT = "TXDOT"
 
 
 # For catchments that may extend in many VPUs
