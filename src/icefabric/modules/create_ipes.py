@@ -19,6 +19,7 @@ from icefabric.schemas.modules import (
     SMP,
     UEB,
     CalibratableScheme,
+    CFEUnits,
     CFEValues,
     IceFractionScheme,
     NoahOwpModular,
@@ -94,21 +95,20 @@ def get_sft_parameters(
             # Default to 0.0 if no matching columns found
             expressions.append(pl.lit(0.0).alias(f"{param_name}_avg"))
     result_df = df.select(expressions)
-    mean_temp = _get_mean_soil_temp()
+
     pydantic_models = []
     for row_dict in result_df.iter_rows(named=True):
         # Instantiate the Pydantic model for each row
         model_instance = SFT(
             catchment=row_dict["divide_id"],
-            smcmax=row_dict["smcmax_avg"],
-            b=row_dict["bexp_avg"],
-            satpsi=row_dict["psisat_avg"],
+            smcmax={"value": row_dict["smcmax_avg"], "units": "m/m"},
+            b={"value": row_dict["bexp_avg"], "units": None},
+            satpsi={"value": row_dict["psisat_avg"], "units": "m"},
             ice_fraction_scheme=IceFractionScheme.XINANJIANG
             if use_schaake is False
             else IceFractionScheme.SCHAAKE,
-            soil_temperature=[
-                mean_temp for _ in range(4)
-            ],  # Assuming 45 degrees in all layers. TODO: Fix this as this doesn't make sense
+            soil_temperature={"value": [280.372, 280.372, 280.372, 280.372], "units": "K"},
+            # Assuming 45 degrees in all layers. TODO: Fix this as this doesn't make sense
         )
         pydantic_models.append(model_instance)
     return pydantic_models
@@ -173,10 +173,10 @@ def get_snow17_parameters(
     crs = gauge["divides"].crs
     transformer = Transformer.from_crs(crs, 4326)
     wgs84_latlon = transformer.transform(result_df["lon"], result_df["lat"])
-    result_df["lon"] = wgs84_latlon[0]
-    result_df["lat"] = wgs84_latlon[1]
+    result_df["lat"] = wgs84_latlon[0]
+    result_df["lon"] = wgs84_latlon[1]
 
-    # Default parameter values used only for CONUS
+    # Default parameter values used for oCONUS or if data is missing.
     result_df["mfmax"] = CalibratableScheme.MFMAX.value
     result_df["mfmin"] = CalibratableScheme.MFMIN.value
     result_df["uadj"] = CalibratableScheme.UADJ.value
@@ -198,8 +198,8 @@ def get_snow17_parameters(
             hru_area=row_dict["areasqkm"],
             latitude=row_dict["lat"],
             elev=row_dict["elevation_mean"],
-            mf_max=row_dict["mfmax"],
-            mf_min=row_dict["mfmin"],
+            mfmax=row_dict["mfmax"],
+            mfmin=row_dict["mfmin"],
             uadj=row_dict["uadj"],
         )
         pydantic_models.append(model_instance)
@@ -259,26 +259,26 @@ def get_smp_parameters(
     result_df = df.select(expressions)
 
     # Initializing parameters dependent to unique modules
-    soil_storage_model = "NA"
-    soil_storage_depth = "NA"
-    water_table_based_method = "NA"
-    soil_moisture_profile_option = "NA"
-    soil_depth_layers = "NA"
-    water_depth_layers = "NA"
-    water_table_depth = "NA"
+    soil_storage_model = None
+    soil_storage_depth = None
+    water_table_based_method = None
+    soil_moisture_profile_option = None
+    soil_depth_layers = None
+    water_depth_layers = None
+    water_table_depth = None
 
     if extra_module:
         if extra_module == "CFE-S" or extra_module == "CFE-X":
             soil_storage_model = SoilScheme.CFE_SOIL_STORAGE.value
-            soil_storage_depth = SoilScheme.CFE_STORAGE_DEPTH.value
+            soil_storage_depth = {"value": SoilScheme.CFE_STORAGE_DEPTH.value, "units": "m"}
         elif extra_module == "TopModel":
             soil_storage_model = SoilScheme.TOPMODEL_SOIL_STORAGE.value
             water_table_based_method = SoilScheme.TOPMODEL_WATER_TABLE_METHOD.value
         elif extra_module == "LASAM":
             soil_storage_model = SoilScheme.LASAM_SOIL_STORAGE.value
             soil_moisture_profile_option = SoilScheme.LASAM_SOIL_MOISTURE.value
-            soil_depth_layers = SoilScheme.LASAM_SOIL_DEPTH_LAYERS.value
-            water_table_depth = SoilScheme.LASAM_WATER_TABLE_DEPTH.value
+            soil_depth_layers = {"value": SoilScheme.LASAM_SOIL_DEPTH_LAYERS.value, "units": "m"}
+            water_table_depth = {"value": SoilScheme.LASAM_WATER_TABLE_DEPTH.value, "units": "m"}
         else:
             raise ValueError(f"Passing unsupported module into endpoint: {extra_module}")
 
@@ -287,9 +287,9 @@ def get_smp_parameters(
         # Instantiate the Pydantic model for each row
         model_instance = SMP(
             catchment=row_dict["divide_id"],
-            smcmax=row_dict["smcmax_avg"],
-            b=row_dict["bexp_avg"],
-            satpsi=row_dict["psisat_avg"],
+            smcmax={"value": row_dict["smcmax_avg"], "units": "m/m"},
+            b={"value": row_dict["bexp_avg"], "units": None},
+            satpsi={"value": row_dict["psisat_avg"], "units": "m"},
             soil_storage_model=soil_storage_model,
             soil_storage_depth=soil_storage_depth,
             water_table_based_method=water_table_based_method,
@@ -365,8 +365,8 @@ def get_lstm_parameters(catalog: Catalog, namespace: str, identifier: str, graph
     crs = gauge["divides"].crs
     transformer = Transformer.from_crs(crs, 4326)
     wgs84_latlon = transformer.transform(result_df["lon"], result_df["lat"])
-    result_df["lon"] = wgs84_latlon[0]
-    result_df["lat"] = wgs84_latlon[1]
+    result_df["lat"] = wgs84_latlon[0]
+    result_df["lon"] = wgs84_latlon[1]
 
     pydantic_models = []
     for _, row_dict in result_df.iterrows():
@@ -880,7 +880,7 @@ def get_ueb_parameters(
     result_df["lon"] = wgs84_latlon[0]
     result_df["lat"] = wgs84_latlon[1]
 
-    # Default parameter values used only for CONUS
+    # Default parameter values
     result_df["jan_temp_range"] = UEBValues.JAN_TEMP.value
     result_df["feb_temp_range"] = UEBValues.FEB_TEMP.value
     result_df["mar_temp_range"] = UEBValues.MAR_TEMP.value
@@ -955,6 +955,7 @@ def get_cfe_parameters(
     cfe_version: str,
     graph: rx.PyDiGraph,
     sft_included: bool = False,
+    rootzone_aet: bool = False,
 ) -> list[CFE]:
     """Creates the initial parameter estimates for the CFE module
 
@@ -971,6 +972,8 @@ def get_cfe_parameters(
         to use Shaake or Xinanjiang for surface partitioning.
     sft_included: bool
         True if SFT is in the "dep_modules_included" definition as declared in HF API repo.
+    rootzone_aet: bool
+        Turn on rootzone based AET (actual evapotranspiration)
 
     Returns
     -------
@@ -995,50 +998,94 @@ def get_cfe_parameters(
     conus_param_df = params_df.filter(pl.col("divide_id").is_in(divides_list)).collect().to_pandas()
     df = pd.merge(conus_param_df, df, on="divide_id", how="left")
 
+    if rootzone_aet:
+        is_aet_rootzone = True
+        soil_layer_depths = {"value": CFEValues.SOIL_LAYER_DEPTHS.value, "units": CFEUnits.SOIL_DEPTH.value}
+        max_rootzone_layer = {"value": CFEValues.MAX_ROOTZONE_LAYER.value, "units": CFEUnits.MAX_ROOTZONE_LAYER.value}
+    else:
+        is_aet_rootzone = False
+        soil_layer_depths = None
+        max_rootzone_layer = None
+
     if cfe_version == "CFE-X":
         surface_partitioning_scheme = CFEValues.XINANJIANG.value
-        urban_decimal_fraction = CFEValues.URBAN_FRACT.value
-        is_sft_coupled = "NA"
+        urban_decimal_fraction = {"value": CFEValues.URBAN_FRACT.value, "units": CFEUnits.URBAN_FRACT.value}
+        ice_content_thresh = None
+        if sft_included:
+            is_sft_coupled = True
+        else:
+            is_sft_coupled = False
     elif cfe_version == "CFE-S":
         surface_partitioning_scheme = CFEValues.SCHAAKE.value
-        a_Xinanjiang_inflection_point_parameter = "NA"
-        b_Xinanjiang_shape_parameter = "NA"
-        x_Xinanjiang_shape_parameter = "NA"
-        urban_decimal_fraction = "NA"
+        urban_decimal_fraction = None
+        a_Xinanjiang_inflection_point_parameter = None
+        b_Xinanjiang_shape_parameter = None
+        x_Xinanjiang_shape_parameter = None
         if sft_included:
-            is_sft_coupled = 1
+            is_sft_coupled = True
+            ice_content_thresh = {"value": CFEValues.ICE_CONTENT_THR.value, "units": CFEUnits.ICE_CONTENT_THR.value}
         else:
-            is_sft_coupled = 0
+            is_sft_coupled = False
+            ice_content_thresh = None
     else:
         raise ValueError(f"Passing unsupported cfe_version into endpoint: {cfe_version}")
 
     pydantic_models = []
     for _, row_dict in df.iterrows():
         # Instantiate the Pydantic model for each row
+        if cfe_version == "CFE-X":
+            a_Xinanjiang_inflection_point_parameter = {
+                "value": row_dict["a_Xinanjiang_inflection_point_parameter"],
+                "units": CFEUnits.A_XINANJIANG_INFLECT.value,
+            }
+            b_Xinanjiang_shape_parameter = {
+                "value": row_dict["b_Xinanjiang_shape_parameter"],
+                "units": CFEUnits.B_XINANJIANG_SHAPE.value,
+            }
+            x_Xinanjiang_shape_parameter = {
+                "value": row_dict["x_Xinanjiang_shape_parameter"],
+                "units": CFEUnits.X_XINANJIANG_SHAPE.value,
+            }
+            urban_decimal_fraction = {
+                "value": row_dict["mean.impervious"],
+                "units": CFEUnits.URBAN_FRACT.value,
+            }
+
         model_instance = CFE(
             catchment=row_dict["divide_id"],
             surface_partitioning_scheme=surface_partitioning_scheme,
             is_sft_coupled=str(is_sft_coupled),
-            soil_params_b=row_dict["mode.bexp_soil_layers_stag=1"],
-            soil_params_satdk=row_dict["geom_mean.dksat_soil_layers_stag=1"],
-            soil_params_satpsi=row_dict["geom_mean.psisat_soil_layers_stag=1"],
-            soil_params_slop=row_dict["mean.slope_1km"],
-            soil_params_smcmax=row_dict["mean.smcmax_soil_layers_stag=1"],
-            soil_params_wltsmc=row_dict["mean.smcwlt_soil_layers_stag=1"],
-            max_gw_storage=row_dict["mean.Zmax"],
-            Cgw=row_dict["mean.Coeff"],
-            expon=row_dict["mode.Expon"],
-            a_Xinanjiang_inflection_point_parameter=str(row_dict["a_Xinanjiang_inflection_point_parameter"])
-            if cfe_version == "CFE-X"
-            else a_Xinanjiang_inflection_point_parameter,
-            b_Xinanjiang_shape_parameter=str(row_dict["b_Xinanjiang_shape_parameter"])
-            if cfe_version == "CFE-X"
-            else b_Xinanjiang_shape_parameter,
-            x_Xinanjiang_shape_parameter=str(row_dict["x_Xinanjiang_shape_parameter"])
-            if cfe_version == "CFE-X"
-            else x_Xinanjiang_shape_parameter,
-            urban_decimal_fraction=str(urban_decimal_fraction),
-            refkdt=row_dict["mean.refkdt"],
+            ice_content_thresh=ice_content_thresh,
+            soil_params_b={"value": row_dict["mode.bexp_soil_layers_stag=1"], "units": CFEUnits.SOIL_B.value},
+            soil_params_satdk={
+                "value": row_dict["geom_mean.dksat_soil_layers_stag=1"],
+                "units": CFEUnits.SOIL_SATDK.value,
+            },
+            soil_params_satpsi={
+                "value": row_dict["geom_mean.psisat_soil_layers_stag=1"],
+                "units": CFEUnits.SOIL_SATPSI.value,
+            },
+            soil_params_slop={"value": row_dict["mean.slope_1km"], "units": CFEUnits.SOIL_SLOP.value},
+            soil_params_smcmax={
+                "value": row_dict["mean.smcmax_soil_layers_stag=1"],
+                "units": CFEUnits.SOIL_SMCMAX.value,
+            },
+            soil_params_wltsmc={
+                "value": row_dict["mean.smcwlt_soil_layers_stag=1"],
+                "units": CFEUnits.SOIL_WLTSMC.value,
+            },
+            max_gw_storage={"value": row_dict["mean.Zmax"], "units": CFEUnits.MAX_GIUH_STORAGE.value},
+            Cgw={"value": row_dict["mean.Coeff"], "units": CFEUnits.EXPON.value},
+            expon={"value": row_dict["mode.Expon"], "units": CFEUnits.EXPON.value},
+            a_Xinanjiang_inflection_point_parameter=a_Xinanjiang_inflection_point_parameter,
+            b_Xinanjiang_shape_parameter=b_Xinanjiang_shape_parameter,
+            x_Xinanjiang_shape_parameter=x_Xinanjiang_shape_parameter,
+            urban_decimal_fraction=urban_decimal_fraction,
+            refkdt={"value": row_dict["mean.refkdt"], "units": CFEUnits.REFKDT.value},
+            is_aet_rootzone=is_aet_rootzone,
+            soil_layer_depths=soil_layer_depths,
+            max_rootzone_layer=max_rootzone_layer,
         )
+
         pydantic_models.append(model_instance)
     return pydantic_models
