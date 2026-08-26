@@ -6,7 +6,7 @@ NOTE - THIS IS A WORK IN PROGRESS
 
 import pyarrow as pa
 from pyiceberg.schema import Schema
-from pyiceberg.types import BinaryType, DoubleType, FloatType, LongType, NestedField, StringType
+from pyiceberg.types import BinaryType, BooleanType, DoubleType, FloatType, LongType, NestedField, StringType
 
 
 class Divides:
