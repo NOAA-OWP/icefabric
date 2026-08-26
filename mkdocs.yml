@@ -61,6 +61,10 @@ nav:
     - API: user_guide/icefabric_api.md
     - Tools: user_guide/icefabric_tools.md
     - Terraform S3 Glue Endpoint: user_guide/terraform.md
-  - Module Support: 
+  - Data Support:
+    - datasets/index.md
+    - Hydrofabric: datasets/hydrofabric.md
+    - RAS XS: datasets/ras_xs.md
+  - Module Support:
     - modules/index.md
     - SFT: modules/sft.md
