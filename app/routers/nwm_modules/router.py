@@ -1,4 +1,3 @@
-from enum import Enum
 from fastapi import APIRouter, Depends, Query
 from pyiceberg.catalog import Catalog
 

@@ -43,6 +43,10 @@ tags_metadata = [
         "name": "NWM Modules",
         "description": "Functions that interact with NWM modules. Mainly supports IPE generation.",
     },
+    {
+        "name": "HEC-RAS XS",
+        "description": "Data querying functions for HEC-RAS cross-sectional data (i.e. per flowpath ID or geospatial queries)",
+    },
 ]
 
 parser = argparse.ArgumentParser(description="The FastAPI App instance for querying versioned EDFS data")
@@ -125,7 +129,7 @@ app.include_router(rise_api_wrap_router, prefix="/v1")
     response_model=HealthCheck,
 )
 
-@app.head(
+@app.get(
     "/health",
     tags=["Health"],
     summary="Perform a Health Check",
