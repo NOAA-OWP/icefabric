@@ -7,6 +7,7 @@ from pyiceberg.catalog import Catalog
 
 from icefabric.modules.create_ipes import get_subset
 from icefabric.modules.divide_attributes import (
+    LASAMParameters,
     ParametersToDivideAttributesHF,
     ParametersToDivideAttributesNHF,
 )
@@ -90,6 +91,26 @@ def get_parameter_metadata(
         else:
             divide_attrs = pd.DataFrame(gauge["divides"])
 
+        # Normalize URL-encoded column names from the SQL catalog back to dot notation
+        # (_x2E → ., _x3D → =) so lookups match the dot-notation names in DivideAttributesHF.
+        # Normalization might be needed depending on how local catalog was created.
+        col_rename = {}
+        for col in divide_attrs.columns:
+            decoded = col.replace("_x2E", ".").replace("_x3D", "=")
+            if decoded != col:
+                col_rename[col] = decoded
+        if col_rename:
+            divide_attrs = divide_attrs.rename(columns=col_rename)
+
+    if gage_id is not None and "lasam" in modules:
+        lasam_params = pd.DataFrame(LASAMParameters.lasam_params)
+
+        # For HF 2.2, the ISLTYP column name differs from NHF's "isltyp_mode"
+        if not domain.is_nhf and "mode.ISLTYP" in divide_attrs.columns:
+            divide_attrs = divide_attrs.rename(columns={"mode.ISLTYP": "isltyp_mode"})
+
+        divide_attrs = pd.merge(divide_attrs, lasam_params, on="isltyp_mode", how="outer")
+
     output_list = []
 
     for module in modules:
@@ -127,7 +148,10 @@ def get_parameter_metadata(
                 for index, row in module_params.iterrows():
                     param_name = row["name"]
                     if param_name in parameter_lookup.keys():
-                        attr_name = parameter_lookup[param_name]
+                        if param_name == "smcmax":
+                            attr_name = parameter_lookup[param_name][0 if module == "lasam" else 1]
+                        else:
+                            attr_name = parameter_lookup[param_name]
                         if attr_name in divide_attrs.columns:
                             attr = divide_attrs[[attr_name, "area_sqkm"]]
                             attr = attr[attr[attr_name].notna()]
