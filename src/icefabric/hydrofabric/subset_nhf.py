@@ -95,7 +95,7 @@ class HydrofabricSource:
         self,
         parquet_dir: Path | None = None,
         catalog: Catalog | None = None,
-        namespace: HydrofabricNamespace = HydrofabricNamespace.NHF,
+        namespace: HydrofabricNamespace = HydrofabricNamespace.CONUS_NHF,
     ):
         self.parquet_dir = parquet_dir
         self.catalog = catalog
@@ -599,7 +599,7 @@ def subset_nhf(
     catalog: Catalog | None = None,
     parquet_dir: Path | None = None,
     output: Path | None = None,
-    namespace: HydrofabricNamespace = HydrofabricNamespace.NHF,
+    namespace: HydrofabricNamespace = HydrofabricNamespace.CONUS_NHF,
 ) -> dict[str, gpd.GeoDataFrame]:
     """Subset hydrofabric by flowpath ID, gage ID, or VPU ID.
 

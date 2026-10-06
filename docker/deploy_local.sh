@@ -94,21 +94,21 @@ echo "[INFO] Branch: $(git branch --show-current 2>/dev/null || echo 'not a git 
 echo "[INFO] Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'N/A')"
 
 # --- Extract archive ---
-ARCHIVE_DIR="/var/tmp/icefabric_local_catalog"
+ARCHIVE_DIR="/tmp/icefabric_local_catalog"
 WAREHOUSE_DIR="$ARCHIVE_DIR/warehouse"
 PYICEBERG_DB="$ARCHIVE_DIR/pyiceberg_catalog.db"
-LOCAL_ICECHUNK="/var/tmp/icefabric_streamflow_obs"
+LOCAL_ICECHUNK="/tmp/icefabric_streamflow_obs"
 
 if [[ -f "$PYICEBERG_DB" && -d "$LOCAL_ICECHUNK" ]]; then
     echo "[INFO] Archive already extracted, skipping download"
 else
     echo "[INFO] Downloading and extracting archive from: $S3_ARCHIVE_PATH"
     ARCHIVE_FILENAME=$(basename "$S3_ARCHIVE_PATH")
-    $AWS_CMD s3 cp "$S3_ARCHIVE_PATH" "/var/tmp/$ARCHIVE_FILENAME"
+    $AWS_CMD s3 cp "$S3_ARCHIVE_PATH" "/tmp/$ARCHIVE_FILENAME"
 
     echo "[INFO] Extracting archive..."
-    tar -xf "/var/tmp/$ARCHIVE_FILENAME" -C /var/tmp/
-    rm -f "/var/tmp/$ARCHIVE_FILENAME"
+    tar -xf "/tmp/$ARCHIVE_FILENAME" -C /tmp/
+    rm -f "/tmp/$ARCHIVE_FILENAME"
 fi
 
 # --- Verify extracted files ---
@@ -151,12 +151,12 @@ $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d
 
 # --- Wait for health check ---
 echo "[INFO] Waiting for API to become healthy..."
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
     if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
         echo "[INFO] API is healthy!"
         break
     fi
-    if [[ $i -eq 30 ]]; then
+    if [[ $i -eq 60 ]]; then
         echo "[WARN] API health check timed out. Check logs with: $DOCKER_COMPOSE -f $COMPOSE_FILE logs api"
     fi
     sleep 2
