@@ -63,7 +63,7 @@ examples = [
   "httpx==0.28.1",
   "ipykernel==6.29.5",
   "ipywidgets==8.1.7",
-  "jupyterlab==4.4.9",
+  "jupyterlab==4.5.11",
   "jupytergis==0.5.0",
 ]
 icechunk_extras = [
